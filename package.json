@@ -1,0 +1,19 @@
+{
+  "name": "pages-programs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "echo": "bun src/host/run-local.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check:portable": "bun scripts/check-portable.ts",
+    "check": "bun run typecheck && bun run test && bun run check:portable"
+  },
+  "dependencies": {
+    "valibot": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^7"
+  }
+}
