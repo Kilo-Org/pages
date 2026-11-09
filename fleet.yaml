@@ -1,0 +1,9 @@
+# Which programs run, and what each one watches. `page` is a page id (the UUID
+# in /p/<id>) or "recent" for your most recently edited page.
+workers:
+  - program: echo
+    watch:
+      - page: recent
+  - program: tally
+    watch:
+      - page: recent

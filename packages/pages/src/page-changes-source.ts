@@ -4,8 +4,8 @@
 // a burst of keystrokes between two polls arrives as one event. The shape of
 // the event is what a real feed would deliver, so programs don't care.
 import * as v from 'valibot'
-import { PagesError, type PagesClient } from './pages-client.ts'
-import type { NodeChange, PageChangedEvent } from './program.ts'
+import { PagesError, type PagesClient } from './client.ts'
+import type { NodeChange, PageChangedEvent } from '@pages-programs/sdk'
 
 export type PageCursor = { heads: string[]; title: string | null }
 

@@ -1,9 +1,9 @@
 // Stand-in for the program host: owns the loop, the cursor and the state, so a
 // program only ever sees `handle(event, ctx)`. A Durable Object supervisor would
 // replace this file; the Program contract and the page source stay as they are.
-import type { PagesClient } from '../pages-client.ts'
-import { openCursor, pollPage, type PageCursor } from '../page-changes-source.ts'
-import type { Program, ProgramContext, ProgramEvent } from '../program.ts'
+import type { PagesClient } from '@pages-programs/pages'
+import { openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
+import type { Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
 
 export type SavedInstance = {
   cursor: PageCursor

@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { bearerAuth, createPagesClient } from '../src/pages-client.ts'
-import { pollPage } from '../src/page-changes-source.ts'
-import { defineProgram } from '../src/program.ts'
-import { runProgram, type SavedInstance } from '../src/host/runtime.ts'
+import { bearerAuth, createPagesClient } from '@pages-programs/pages'
+import { pollPage } from '@pages-programs/pages'
+import { defineProgram } from '@pages-programs/sdk'
+import { runProgram, type SavedInstance } from './runtime.ts'
 
 type Reply = { status?: number; body: unknown }
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import echo, { textDelta } from '../src/programs/echo.ts'
-import type { NodeChange, PageChangedEvent, ProgramContext } from '../src/program.ts'
+import echo, { textDelta } from './index.ts'
+import type { NodeChange, PageChangedEvent, ProgramContext } from '@pages-programs/sdk'
 
 function harness() {
   const lines: string[] = []

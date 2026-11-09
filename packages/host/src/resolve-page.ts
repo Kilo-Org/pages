@@ -1,5 +1,5 @@
 import * as v from 'valibot'
-import type { PagesClient } from '../pages-client.ts'
+import type { PagesClient } from '@pages-programs/pages'
 
 const ListPages = v.object({
   pages: v.array(v.object({ page_id: v.string(), title: v.string() })),

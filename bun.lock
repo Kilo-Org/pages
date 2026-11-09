@@ -4,18 +4,41 @@
   "workspaces": {
     "": {
       "name": "pages",
-      "dependencies": {
-        "valibot": "^1.5.0",
-      },
       "devDependencies": {
+        "@pages-programs/sdk": "workspace:*",
         "@types/bun": "latest",
-      },
-      "peerDependencies": {
         "typescript": "^7",
       },
     },
+    "packages/host": {
+      "name": "@pages-programs/host",
+      "version": "0.0.0",
+      "dependencies": {
+        "@pages-programs/pages": "workspace:*",
+        "@pages-programs/sdk": "workspace:*",
+        "valibot": "^1.5.0",
+      },
+    },
+    "packages/pages": {
+      "name": "@pages-programs/pages",
+      "version": "0.0.0",
+      "dependencies": {
+        "@pages-programs/sdk": "workspace:*",
+        "valibot": "^1.5.0",
+      },
+    },
+    "packages/sdk": {
+      "name": "@pages-programs/sdk",
+      "version": "0.0.0",
+    },
   },
   "packages": {
+    "@pages-programs/host": ["@pages-programs/host@workspace:packages/host"],
+
+    "@pages-programs/pages": ["@pages-programs/pages@workspace:packages/pages"],
+
+    "@pages-programs/sdk": ["@pages-programs/sdk@workspace:packages/sdk"],
+
     "@types/bun": ["@types/bun@1.4.4", "", { "dependencies": { "bun-types": "1.4.4" } }, "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ=="],
 
     "@types/node": ["@types/node@26.6.6", "", { "dependencies": { "undici-types": "~8.9.0" } }, "sha512-MzQj+8Kx3XI40OmUAE6Qoh58ZMNstNNMwn2nfd3qWsfe7nDNSqJNzes4njhz6AHwrSHOffSLwXU6yb474Q4aog=="],

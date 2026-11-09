@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { bearerAuth, createPagesClient } from '../src/pages-client.ts'
-import { resolvePage } from '../src/host/resolve-page.ts'
+import { bearerAuth, createPagesClient } from '@pages-programs/pages'
+import { resolvePage } from './resolve-page.ts'
 
 function clientReplying(body: unknown) {
   const calls: unknown[] = []

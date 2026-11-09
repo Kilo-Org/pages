@@ -1,7 +1,7 @@
 // Local development only. A `celld dev` Pages instance runs a loopback OIDC
 // issuer that approves automatically; walking its redirects yields a 6 hour
 // session cookie for the local developer. Production uses a bearer API key.
-import type { PagesAuth } from '../pages-client.ts'
+import type { PagesAuth } from '@pages-programs/pages'
 
 const SESSION_COOKIE = '__Host-nteract_cloud_server_session'
 

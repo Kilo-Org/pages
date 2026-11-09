@@ -28,6 +28,9 @@ export type PageChangedEvent = {
 
 export type ProgramEvent = PageChangedEvent
 
+/** Every event type a manifest may subscribe to. */
+export const eventTypes = ['page.changed'] as const satisfies readonly ProgramEvent['type'][]
+
 export type ProgramState = {
   get<T>(key: string): Promise<T | undefined>
   set<T>(key: string, value: T): Promise<void>

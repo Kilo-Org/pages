@@ -2,17 +2,19 @@
   "name": "pages-programs",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "echo": "bun src/host/run-local.ts",
-    "test": "bun test",
+    "pp": "bun packages/host/src/cli.ts",
+    "up": "bun packages/host/src/cli.ts up",
     "typecheck": "tsc --noEmit",
+    "test": "bun test",
     "check:portable": "bun scripts/check-portable.ts",
     "check": "bun run typecheck && bun run test && bun run check:portable"
   },
-  "dependencies": {
-    "valibot": "^1.5.0"
-  },
   "devDependencies": {
+    "@pages-programs/sdk": "workspace:*",
     "@types/bun": "latest",
     "typescript": "^7"
   }

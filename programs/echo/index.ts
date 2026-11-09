@@ -1,4 +1,4 @@
-import { defineProgram, type NodeChange, type ProgramContext } from '../program.ts'
+import { defineProgram, type NodeChange, type ProgramContext } from '@pages-programs/sdk'
 
 export type TextDelta = { removed: string; added: string }
 
