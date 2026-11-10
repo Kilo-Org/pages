@@ -2,7 +2,14 @@
 // program only ever sees `handle(event, ctx)`. A Durable Object supervisor would
 // replace this file; the Program contract and the page source stay as they are.
 import type { PagesClient } from '@pages-programs/pages'
-import { addBlockComment, editComment, openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
+import {
+  addBlockComment,
+  editComment,
+  emptySelectionCursor,
+  openCursor,
+  pollPage,
+  type PageCursor,
+} from '@pages-programs/pages'
 import type { LlmCapability, Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
 
 export type SavedInstance = {
@@ -33,7 +40,12 @@ export type RunOptions = {
 export async function runProgram(options: RunOptions): Promise<void> {
   const { program, client, pageId, store, signal } = options
   const saved = await store.load()
-  let cursor = saved?.cursor ?? (await openCursor(client, pageId))
+  const opened = saved?.cursor ?? (await openCursor(client, pageId))
+  let cursor: PageCursor = {
+    ...opened,
+    commentHeads: opened.commentHeads ?? null,
+    selection: opened.selection ?? emptySelectionCursor(),
+  }
   const kv: Record<string, unknown> = saved?.kv ?? {}
   let lastEventId = saved?.lastEventId ?? null
   let handled = 0
@@ -77,9 +89,23 @@ export async function runProgram(options: RunOptions): Promise<void> {
   await persist()
   options.log(`watching ${cursor.title ?? pageId} @ ${cursor.heads[0]?.slice(0, 8)} as "${program.manifest.name}"`)
 
+  // One identity read, not one per poll. Without it we cannot tell echo's own
+  // comments from a person's, so comment and presence watching is disabled
+  // rather than risking a self-reply loop.
+  let ownPrincipal: string | null = null
+  try {
+    ownPrincipal = (await client.whoami()).principal
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    options.log(`comment/selection watching disabled: ${message}`)
+  }
+
   while (!signal.aborted) {
     try {
-      const result = await pollPage(client, pageId, cursor)
+      const result = await pollPage(client, pageId, cursor, {
+        ownPrincipal,
+        log: options.log,
+      })
       failures = 0
       const event: ProgramEvent | null = result.event
       if (event && program.manifest.triggers.includes(event.type) && event.id !== lastEventId) {

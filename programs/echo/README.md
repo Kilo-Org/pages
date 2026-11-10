@@ -67,6 +67,27 @@ When Pages gets a real event feed, only the middle of the diagram changes: the p
 is replaced by a subscription that emits the same `page.changed` event. The program
 does not change.
 
+## Seeing comments and selections
+
+The same poll also watches the page's two other user surfaces:
+
+- **Comments.** `read_page_changes` is called with `comments: "all"` and the
+  comments document's own `since_comment_heads`, so a comment-only change is a
+  real event even when the Page's `heads` do not move. Each changed message
+  carries its thread, body, and author.
+- **Selections.** `read_page_presence` is an ephemeral snapshot with no server
+  cursor. `packages/pages/src/presence-source.ts` fingerprints each attached
+  selection locally and emits `selected` / `updated` / `cleared`. A selection
+  is context, not a request: echo logs it and never replies to it on its own.
+- **No self-replies.** The host reads `GET /whoami` once at startup and the
+  source drops any comment or selection authored by that principal before the
+  event is built. Echo's own comments can never re-enter its stream. If
+  `whoami` fails, comment and presence watching is disabled rather than
+  risking a loop.
+- **Event identity.** The event id includes both document revisions and a local
+  selection epoch, so comment-only and selection-only events deduplicate
+  correctly across redeliveries while body-only ids stay stable.
+
 ## Replying to settled text, speculatively
 
 Besides logging, `echo` watches for a block of text that reads like a
@@ -118,8 +139,9 @@ the author is necessarily done, not after a long fixed wait:
   retried write after a crash replays the original receipt instead of
   posting or editing twice.
 - **No self-reply loop.** `echo` never edits page content, and a comment
-  write never moves the Page's content `heads` — so echo's own reply can
-  never show up as a new `page.changed` event for it to react to.
+  write only moves the comments document. The source drops any comment
+  authored by the host's own `/whoami` principal before the event is built,
+  so echo's own reply can never show up as a new event for it to react to.
 - **Failures back off, they don't hot-loop.** A failed decide/write attempt
   doesn't retry on the very next poll — backoff starts at
   `SPECULATIVE_PAUSE_MS` and doubles (capped at 5 minutes). An aborted
