@@ -174,17 +174,31 @@ describe('targets and the commit fence', () => {
     ).toBe(false)
   })
 
-  test('recordBodyChange creates then bumps the target intent', () => {
+  test('recordBodyChange carries the fence and bumps an existing intent', () => {
     const first = recordBodyChange(emptyRoom('p'), target(), { eventId: 'e1', at }, at)
-    const intent = findActiveIntentForTarget(first, 'nodes/b1:0')
-    expect(intent?.version).toBe(1)
+    expect(findActiveIntentForTarget(first, 'nodes/b1:0')).toBeUndefined()
     expect(first.targets['nodes/b1:0']).toMatchObject({
       generation: 1,
-      assumedIntentVersion: 1,
+      assumedIntentVersion: null,
     })
 
-    const second = recordBodyChange(
+    const admitted = admitIntent(
       first,
+      {
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [{ eventId: 'e1', at }],
+      },
+      at,
+    )
+    const fenced = recordTarget(admitted.room, {
+      ...first.targets['nodes/b1:0']!,
+      assumedIntentVersion: admitted.intent.version,
+    })
+    const second = recordBodyChange(
+      fenced,
       target({ text: 'Hello again' }),
       { eventId: 'e2', at },
       at,
@@ -198,11 +212,21 @@ describe('targets and the commit fence', () => {
   })
 
   test('removeTarget abandons its intent', () => {
-    const room = recordBodyChange(emptyRoom('p'), target(), { eventId: 'e1', at }, at)
-    const intent = findActiveIntentForTarget(room, 'nodes/b1:0')!
+    const admitted = admitIntent(
+      emptyRoom('p'),
+      {
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [],
+      },
+      at,
+    )
+    const room = recordTarget(admitted.room, target())
     const next = removeTarget(room, 'nodes/b1:0')
     expect(next.targets['nodes/b1:0']).toBeUndefined()
-    expect(next.intents[intent.id]?.status).toBe('abandoned')
+    expect(next.intents[admitted.intent.id]?.status).toBe('abandoned')
   })
 })
 

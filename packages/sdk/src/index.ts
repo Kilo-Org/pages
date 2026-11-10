@@ -121,6 +121,12 @@ export type CommentsCapability = {
     body: string
     dedupeOn: string
   }): Promise<{ threadId: string; messageId: string }>
+  /** Replies in an existing thread. Same idempotency approach. */
+  replyToThread(input: {
+    threadId: string
+    body: string
+    dedupeOn: string
+  }): Promise<{ threadId: string; messageId: string }>
 }
 
 export type ProgramContext = {

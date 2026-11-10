@@ -6,9 +6,16 @@ import {
   type SelectionChange,
 } from '@pages-programs/sdk'
 import {
+  applyTriage,
+  attachThreadToIntent,
   clearSelection,
+  closeIntentForThread,
+  commentHandled,
   commitIsCurrent,
   emptyRoom,
+  findActiveIntentForTarget,
+  findIntentForThread,
+  markCommentHandled,
   migrateNodes,
   noteSelection,
   recordBodyChange,
@@ -18,6 +25,16 @@ import {
   type RoomState,
   type TargetState,
 } from './room.ts'
+import {
+  kindFor,
+  parseTriage,
+  triageBody,
+  triageComment,
+  triagePrompt,
+  TRIAGE_SYSTEM_PROMPT,
+  type Ambiguous,
+  type Triage,
+} from './triage.ts'
 
 export type TextDelta = { removed: string; added: string }
 
@@ -54,7 +71,16 @@ const ROOM_LOCK = 'room-lock'
 /** Reads the room, upgrading PR 3's flat `nodes/*` records once. */
 async function loadRoom(ctx: ProgramContext, pageId = ''): Promise<RoomState> {
   const stored = await ctx.state.get<RoomState>(ROOM_KEY)
-  if (stored && stored.schemaVersion === 1) return stored
+  if (stored && stored.schemaVersion === 1) {
+    return {
+      ...stored,
+      intents: stored.intents ?? {},
+      steps: stored.steps ?? {},
+      targets: stored.targets ?? {},
+      selections: stored.selections ?? {},
+      handledComments: stored.handledComments ?? {},
+    }
+  }
   const records: Record<string, unknown> = {}
   for (const key of await ctx.state.list('nodes/')) records[key] = await ctx.state.get(key)
   if (Object.keys(records).length === 0) return emptyRoom(pageId || stored?.pageId || '')
@@ -119,6 +145,18 @@ const SYSTEM_PROMPT = [
   'When respond is true, reply is a short, direct answer (1-3 sentences). When false, reply is null.',
 ].join(' ')
 
+const COMMENT_SYSTEM_PROMPT = [
+  'You are answering a reply in one comment thread on a collaborative page.',
+  'Answer only if the message asks or requests something; stay silent for acknowledgements.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": boolean, "reply": string or null}.',
+  'When respond is true, reply is a short, direct answer (1-3 sentences).',
+].join(' ')
+
+const CLARIFY_SYSTEM_PROMPT = [
+  'The request on this page is ambiguous. Ask one short, specific clarifying question.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string}.',
+].join(' ')
+
 const FOLLOWUP_SYSTEM_PROMPT = [
   'You watch one block of text on a collaborative page. You already replied to it once; the text has changed since.',
   'The change may be a correction, a refinement, unrelated new content, or nothing worth updating your reply for.',
@@ -145,6 +183,36 @@ function parseDecision(raw: string): Decision {
 }
 
 type SpeculativeAttempt = { baseText: string; controller: AbortController }
+
+/** Runs the model classifier only when the deterministic signals disagree. */
+async function resolveTriage(
+  ctx: ProgramContext,
+  verdict: Triage | Ambiguous,
+  surface: 'body' | 'comment',
+  text: string,
+  room: RoomState,
+  targetKey: string | null,
+  signal?: AbortSignal,
+): Promise<Triage> {
+  if (!('ambiguous' in verdict)) return verdict
+  try {
+    const raw = await ctx.llm!.complete({
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: triagePrompt(surface, text, room, targetKey),
+      ...(signal ? { signal } : {}),
+    })
+    return parseTriage(raw)
+  } catch (error) {
+    if (isAbortError(error)) throw error
+    return {
+      outcome: 'clarify',
+      intentId: null,
+      confidence: 0,
+      reason: 'classification failed',
+      source: 'model',
+    }
+  }
+}
 
 /** Cancels and forgets any in-flight speculative work for `key` — a no-op if there is none. */
 function abortSpeculative(ctx: ProgramContext, key: string): void {
@@ -216,12 +284,63 @@ const backoffFor = (failures: number) =>
  * the room lock, immediately before the write.
  */
 async function attempt(key: string, base: TargetState, ctx: ProgramContext, signal: AbortSignal): Promise<void> {
-  const system = base.threadId ? FOLLOWUP_SYSTEM_PROMPT : SYSTEM_PROMPT
-  const prompt = base.threadId ? `Previous reply: ${JSON.stringify(base.lastReply)}\n\nCurrent text: ${base.text}` : base.text
   try {
+    const snapshot = await loadRoom(ctx, base.pageId)
+    const verdict = triageBody(base.text, snapshot, key)
+    const triage = await resolveTriage(ctx, verdict, 'body', base.text, snapshot, key, signal)
+    const now = new Date().toISOString()
+    const intentId = await updateRoom(ctx, base.pageId, (room) => {
+      const next = applyTriage(
+        room,
+        {
+          intentId: triage.intentId,
+          kind: kindFor(triage.outcome),
+          targetScope: { pageId: base.pageId, blockId: base.blockId, nodeKey: key },
+          confidence: triage.confidence,
+          evidence: { eventId: `${key}:${base.generation}`, at: now },
+        },
+        now,
+        false,
+      )
+      const intent = findActiveIntentForTarget(next, key)
+      const target = next.targets[key]
+      return {
+        room:
+          intent && target
+            ? recordTarget(next, { ...target, assumedIntentVersion: intent.version })
+            : next,
+        value: intent?.id ?? null,
+      }
+    })
+    if (triage.outcome === 'ignore') {
+      await updateRoom(ctx, base.pageId, (room) => {
+        const target = room.targets[key]
+        if (!target) return { room, value: undefined }
+        return {
+          room: recordTarget(room, {
+            ...target,
+            evaluatedText: target.text,
+            failures: 0,
+            lastAttemptAt: Date.now(),
+          }),
+          value: undefined,
+        }
+      })
+      ctx.log(`ignored ${base.blockId.slice(0, 8)}: ${triage.reason}`)
+      return
+    }
+    const system =
+      triage.outcome === 'clarify'
+        ? CLARIFY_SYSTEM_PROMPT
+        : base.threadId
+          ? FOLLOWUP_SYSTEM_PROMPT
+          : SYSTEM_PROMPT
+    const prompt = base.threadId
+      ? `Previous reply: ${JSON.stringify(base.lastReply)}\n\nCurrent text: ${base.text}`
+      : base.text
     const raw = await ctx.llm!.complete({ system, prompt, signal })
     const decision = parseDecision(raw)
-    const outcome = await updateRoom(ctx, undefined, async (room) => {
+    const outcome = await updateRoom(ctx, base.pageId, async (room) => {
       const fresh = room.targets[key]
       const current = commitIsCurrent(room, key, {
         text: base.text,
@@ -242,31 +361,30 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         }
         lastReply = decision.reply
       }
-      return {
-        room: recordTarget(room, {
-          ...fresh,
-          evaluatedText: fresh.text,
-          failures: 0,
-          lastAttemptAt: Date.now(),
-          threadId,
-          messageId,
-          lastReply,
-        }),
-        value: 'written' as const,
-      }
+      let nextRoom = recordTarget(room, {
+        ...fresh,
+        evaluatedText: fresh.text,
+        failures: 0,
+        lastAttemptAt: Date.now(),
+        threadId,
+        messageId,
+        lastReply,
+      })
+      if (intentId && threadId) nextRoom = attachThreadToIntent(nextRoom, intentId, threadId)
+      return { room: nextRoom, value: 'written' as const }
     })
     if (outcome === 'discarded') {
       ctx.log(`draft for ${base.blockId.slice(0, 8)} discarded: text or intent moved on before it was ready`)
     }
   } catch (error) {
     if (isAbortError(error)) return // intentional cancel — not a failure, nothing to record
-    const snapshot = await loadRoom(ctx)
+    const snapshot = await loadRoom(ctx, base.pageId)
     const fresh = snapshot.targets[key] ?? base
     const failures = fresh.failures + 1
     const message = error instanceof Error ? error.message : String(error)
     ctx.log(`decide/reply failed (attempt ${failures}), backing off ${backoffFor(failures)}ms: ${message}`)
     // Don't mark evaluated — retry later, at an increasing delay, instead of giving up or hot-looping.
-    await updateRoom(ctx, undefined, (room) => {
+    await updateRoom(ctx, base.pageId, (room) => {
       const target = room.targets[key]
       if (!target) return { room, value: undefined }
       return {
@@ -275,6 +393,93 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       }
     })
   }
+}
+
+/** Comment changes are discrete: triage and answer immediately, no debounce. */
+async function handleComment(
+  change: CommentChange,
+  ctx: ProgramContext,
+  pageId: string,
+  eventId: string,
+  at: string,
+): Promise<void> {
+  if (change.change === 'deleted') {
+    await updateRoom(ctx, pageId, (room) => ({
+      room: closeIntentForThread(room, change.threadId),
+      value: undefined,
+    }))
+    return
+  }
+  if (!change.messageId) return
+  const handleKey = `${change.messageId}:${change.body ?? ''}`
+  const snapshot = await loadRoom(ctx, pageId)
+  if (commentHandled(snapshot, change.threadId, handleKey)) return
+
+  const verdict = triageComment(change, snapshot)
+  const triage = await resolveTriage(
+    ctx,
+    verdict,
+    'comment',
+    change.body ?? '',
+    snapshot,
+    null,
+  )
+  const intentId = await updateRoom(ctx, pageId, (room) => {
+    const next = applyTriage(
+      room,
+      {
+        intentId: triage.intentId,
+        kind: kindFor(triage.outcome),
+        targetScope: {
+          pageId,
+          ...(change.blockId ? { blockId: change.blockId } : {}),
+          threadId: change.threadId,
+        },
+        confidence: triage.confidence,
+        evidence: { eventId, at, messageId: change.messageId! },
+      },
+      at,
+      true,
+    )
+    return { room: next, value: findIntentForThread(next, change.threadId)?.id ?? null }
+  })
+
+  const markHandled = () =>
+    updateRoom(ctx, pageId, (room) => ({
+      room: markCommentHandled(room, change.threadId, handleKey),
+      value: undefined,
+    }))
+
+  if (triage.outcome === 'ignore') {
+    await markHandled()
+    ctx.log(`ignored comment ${change.threadId.slice(0, 8)}: ${triage.reason}`)
+    return
+  }
+
+  const raw = await ctx.llm!.complete({
+    system: triage.outcome === 'clarify' ? CLARIFY_SYSTEM_PROMPT : COMMENT_SYSTEM_PROMPT,
+    prompt: `Thread ${change.threadId}\nComment: ${change.body ?? ''}`,
+  })
+  const decision = parseDecision(raw)
+  if (!decision.respond || !decision.reply) {
+    await markHandled()
+    return
+  }
+
+  const result = await updateRoom(ctx, pageId, async (room) => {
+    if (commentHandled(room, change.threadId, handleKey))
+      return { room, value: 'duplicate' as const }
+    const posted = await ctx.comments!.replyToThread({
+      threadId: change.threadId,
+      body: decision.reply!,
+      dedupeOn: handleKey,
+    })
+    let next = markCommentHandled(room, change.threadId, handleKey)
+    if (intentId) next = attachThreadToIntent(next, intentId, change.threadId)
+    return { room: next, value: 'posted' as const }
+  })
+  if (result === 'posted')
+    ctx.log(`replied in thread ${change.threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
 }
 
 function describeComment(change: CommentChange): string {
@@ -304,6 +509,7 @@ export default defineProgram({
           value: undefined,
         }))
         ctx.log(describeComment(change))
+        if (ctx.llm && ctx.comments) await handleComment(change, ctx, event.pageId, event.id, event.at)
         continue
       }
       if (change.surface === 'selection') {

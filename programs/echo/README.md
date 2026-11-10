@@ -101,14 +101,35 @@ ledger plus the bookkeeping the executor needs.
   dedupe text, backoff, and the `generation` / `assumedIntentVersion` fence.
 - `selections` — the latest person selection per peer, used as scope evidence.
 
-A body change creates the target's `action` intent on first sight and bumps
-its version on later change. `attempt()` reads the model outside the room
-lock, then re-checks text, generation, and intent version immediately before
-writing. The lock covers the check and the write, not the model call, so one
-slow draft does not block other targets.
+Triage creates the target's intent (action, correction, chat, or clarify);
+a later change to an active target bumps its version. `attempt()` reads the
+model outside the room lock, then re-checks text, generation, and intent
+version immediately before writing. The lock covers the check and the write,
+not the model call, so one slow draft does not block other targets.
 
 PR 3's flat `nodes/*` records are migrated once into `room.targets` on first
 read. The old keys stay in place so a rollback still has reply identity.
+
+## Triaging before answering
+
+Every user change is classified against the room before echo decides to
+answer:
+
+| Signal | Outcome |
+| --- | --- |
+| explicit correction language, or an edit overlapping an active intent | `correction` |
+| a question | `chat` |
+| request language ("please", add/fix/change/shorten/…) | `new_action` |
+| hedged language ("maybe", "not sure", "should we") | ambiguous → one model classification call |
+| a statement not addressed to an agent | `ignore` |
+
+`clarify` is the fallback when the classification model returns malformed
+output. A clear correction never calls the classification model; it goes
+straight to the answer generation call.
+
+A comment on an active thread is answered in that thread with
+`replyToThread`, not by creating a new block comment. The handled message
+body is recorded per thread, so a redelivered event cannot double-reply.
 
 ## Replying to settled text, speculatively
 

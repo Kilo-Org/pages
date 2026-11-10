@@ -6,6 +6,7 @@ import {
   addBlockComment,
   editComment,
   emptySelectionCursor,
+  replyToComment,
   openCursor,
   pollPage,
   type PageCursor,
@@ -82,6 +83,7 @@ export async function runProgram(options: RunOptions): Promise<void> {
     comments: {
       addBlock: (input) => addBlockComment(client, { pageId, ...input }),
       editMessage: (input) => editComment(client, { pageId, ...input }),
+      replyToThread: (input) => replyToComment(client, { pageId, ...input }),
     },
   }
 

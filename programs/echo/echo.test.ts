@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import echo, { attempt, looksComplete, SPECULATIVE_PAUSE_MS, textDelta } from './index.ts'
 import type { RoomState, TargetState } from './room.ts'
+import { TRIAGE_SYSTEM_PROMPT } from './triage.ts'
 import type {
   BodyChange,
   CommentsCapability,
@@ -77,12 +78,15 @@ function deferredLlm() {
 function fakeComments(): CommentsCapability & {
   posts: { blockId: string; body: string; dedupeOn: string }[]
   edits: { threadId: string; messageId: string; body: string; dedupeOn: string }[]
+  replies: { threadId: string; body: string; dedupeOn: string }[]
 } {
   const posts: { blockId: string; body: string; dedupeOn: string }[] = []
   const edits: { threadId: string; messageId: string; body: string; dedupeOn: string }[] = []
+  const replies: { threadId: string; body: string; dedupeOn: string }[] = []
   return {
     posts,
     edits,
+    replies,
     addBlock: async (input) => {
       posts.push(input)
       return { threadId: `thread-${posts.length}`, messageId: `message-${posts.length}` }
@@ -90,6 +94,10 @@ function fakeComments(): CommentsCapability & {
     editMessage: async (input) => {
       edits.push(input)
       return { threadId: input.threadId, messageId: input.messageId }
+    },
+    replyToThread: async (input) => {
+      replies.push(input)
+      return { threadId: input.threadId, messageId: `reply-${replies.length}` }
     },
   }
 }
@@ -256,15 +264,20 @@ describe('echo program', () => {
     expect((kv.room as RoomState).targets).toEqual({})
   })
 
-  test('a body change creates an intent; the next change bumps its version and generation', async () => {
-    const { kv, ctx } = harness()
+  test('triage creates the intent; the next change bumps its version and generation', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'Yes.' }))
+    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
     await echo.handle(event(1, [node('updated', 'Question?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
     const first = kv.room as RoomState
     const intentId = Object.keys(first.intents)[0]!
     expect(first.intents[intentId]).toMatchObject({ version: 1, status: 'active' })
     expect(first.targets['nodes/b1:0']).toMatchObject({ generation: 1, assumedIntentVersion: 1 })
 
     await echo.handle(event(2, [node('updated', 'Question two?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
     const second = kv.room as RoomState
     expect(second.intents[intentId]?.version).toBe(2)
     expect(second.targets['nodes/b1:0']).toMatchObject({
@@ -279,7 +292,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
   test('does not start a draft before the pause elapses, for text with no completeness signal', async () => {
     const d = deferredLlm()
     const { ctx } = harness({ llm: d.llm, comments: fakeComments() })
-    await echo.handle(event(1, [node('updated', 'still thinking out loud')]), ctx)
+    await echo.handle(event(1, [node('updated', 'please tighten this paragraph')]), ctx)
     await echo.tick!(ctx)
     await flush()
     expect(d.calls).toBe(0)
@@ -288,12 +301,12 @@ describe('echo tick — speculative scheduling (Part A)', () => {
   test('starts a draft after a short pause, well under the old 8s quiet period', async () => {
     const d = deferredLlm()
     const { kv, ctx } = harness({ llm: d.llm, comments: fakeComments() })
-    await echo.handle(event(1, [node('updated', 'still thinking out loud')]), ctx)
+    await echo.handle(event(1, [node('updated', 'please tighten this paragraph')]), ctx)
     backdate(kv, 'nodes/b1:0', SPECULATIVE_PAUSE_MS + 500)
     await echo.tick!(ctx)
     await flush()
     expect(d.calls).toBe(1)
-    expect(d.promptSeen).toBe('still thinking out loud')
+    expect(d.promptSeen).toBe('please tighten this paragraph')
   })
 
   test('skips the pause entirely for text that already looks sentence-complete', async () => {
@@ -313,6 +326,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
     backdate(kv, 'nodes/b1:0', SPECULATIVE_PAUSE_MS + 500)
     await echo.tick!(ctx)
+    await flush()
     d.resolve({ respond: true, reply: 'Yes.' })
     await flush()
     expect(comments.posts).toEqual([{ blockId: 'b1', body: 'Yes.', dedupeOn: 'Does it work?' }])
@@ -326,14 +340,14 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     // No trailing punctuation on either text: neither looks complete, so this stays on the
     // pause-based path and no second draft starts right after the edit (kept separate from
     // the looksComplete+abort interaction, covered below).
-    await echo.handle(event(1, [node('updated', 'still thinking about this')]), ctx)
+    await echo.handle(event(1, [node('updated', 'please tighten this paragraph')]), ctx)
     backdate(kv, 'nodes/b1:0', SPECULATIVE_PAUSE_MS + 500)
     await echo.tick!(ctx)
     await flush()
     expect(d.calls).toBe(1)
 
     // New input arrives before the draft resolved — handle() aborts it directly.
-    await echo.handle(event(2, [node('updated', 'still thinking about this some more')]), ctx)
+    await echo.handle(event(2, [node('updated', 'please tighten this paragraph more')]), ctx)
     await echo.tick!(ctx)
     await flush()
 
@@ -578,10 +592,11 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
       editMessage: async () => {
         throw new Error('pages api down')
       },
+      replyToThread: async () => ({ threadId: 'x', messageId: 'z' }),
     }
     const llm = fakeLlm(() => ({ respond: true, reply: 'update' }))
     const { ctx } = harness({ llm, comments })
-    const base = record({ text: 'new text', threadId: 'thread-1', messageId: 'message-1', lastReply: 'old reply' })
+    const base = record({ text: 'new question?', threadId: 'thread-1', messageId: 'message-1', lastReply: 'old reply' })
     await ctx.state.set('nodes/b1:0', base)
     await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
     const saved = await savedTarget(ctx)
@@ -597,10 +612,164 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
       },
     }
     const { ctx } = harness({ llm, comments })
-    const base = record({ text: 'x' })
+    const base = record({ text: 'Does it work?' })
     await ctx.state.set('nodes/b1:0', base)
     await attempt('nodes/b1:0', base, ctx, controller.signal)
     const saved = await savedTarget(ctx)
     expect(saved).toEqual(base) // untouched — abort isn't a failure
+  })
+})
+
+function scriptedLlm(
+  respond: (system: string, prompt: string, index: number) => string | Record<string, unknown>,
+) {
+  const calls: { system: string; prompt: string }[] = []
+  const llm: LlmCapability = {
+    complete: async ({ system, prompt }) => {
+      calls.push({ system: system ?? '', prompt })
+      const value = respond(system ?? '', prompt, calls.length - 1)
+      return typeof value === 'string' ? value : JSON.stringify(value)
+    },
+  }
+  return { calls, llm }
+}
+
+const commentChange = (overrides: Partial<import('@pages-programs/sdk').CommentChange> = {}) => ({
+  surface: 'comment' as const,
+  change: 'inserted',
+  threadId: 't1',
+  messageId: 'm1',
+  blockId: 'b1',
+  body: 'Can you explain this?',
+  authorPrincipal: 'person-1',
+  authorDisplayName: 'Person',
+  driver: 'Browser',
+  actorKind: 'person' as const,
+  priority: 1 as const,
+  ...overrides,
+})
+
+describe('triage wiring', () => {
+  test('an unambiguous correction never calls the classification model', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'Shorter answer.' }))
+    const comments = fakeComments()
+    const { ctx } = harness({ llm: spy.llm, comments })
+    await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    await echo.handle(event(2, [node('updated', 'Actually make it shorter.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(spy.calls.filter((call) => call.system === TRIAGE_SYSTEM_PROMPT)).toHaveLength(0)
+    expect(comments.posts).toHaveLength(1)
+    expect(comments.edits).toHaveLength(1)
+  })
+
+  test('an ambiguous body change gets one classification call, then one generation call', async () => {
+    const spy = scriptedLlm((system) =>
+      system === TRIAGE_SYSTEM_PROMPT
+        ? { outcome: 'new_action', intentId: null, confidence: 0.8, reason: 'model' }
+        : { respond: true, reply: 'Sure.' },
+    )
+    const comments = fakeComments()
+    const { ctx } = harness({ llm: spy.llm, comments })
+    await echo.handle(event(1, [node('updated', 'Maybe the intro needs work.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(spy.calls[0]?.system).toBe(TRIAGE_SYSTEM_PROMPT)
+    expect(spy.calls).toHaveLength(2)
+    expect(comments.posts).toHaveLength(1)
+  })
+
+  test('malformed classification falls back to clarify instead of an edit', async () => {
+    const spy = scriptedLlm((system) =>
+      system === TRIAGE_SYSTEM_PROMPT
+        ? 'not json'
+        : { respond: true, reply: 'Do you want the intro shortened?' },
+    )
+    const comments = fakeComments()
+    const { ctx } = harness({ llm: spy.llm, comments })
+    await echo.handle(event(1, [node('updated', 'Maybe the intro needs work.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(spy.calls[1]?.system).toContain('ambiguous')
+    expect(comments.posts).toEqual([
+      { blockId: 'b1', body: 'Do you want the intro shortened?', dedupeOn: 'Maybe the intro needs work.' },
+    ])
+  })
+
+  test('a person comment gets a threaded reply, and redelivery does not duplicate it', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'Yes, that is the idea.' }))
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm: spy.llm, comments })
+    const change = commentChange()
+
+    await echo.handle(event(1, [change]), ctx)
+    expect(comments.replies).toEqual([
+      {
+        threadId: 't1',
+        body: 'Yes, that is the idea.',
+        dedupeOn: 'm1:Can you explain this?',
+      },
+    ])
+    const intent = Object.values((kv.room as RoomState).intents)[0]!
+    expect(intent.targetScope.threadId).toBe('t1')
+
+    await echo.handle(event(1, [change]), ctx)
+    expect(comments.replies).toHaveLength(1)
+  })
+
+  test('a correction in the same comment thread bumps the intent version', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'Updated.' }))
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm: spy.llm, comments })
+    await echo.handle(event(1, [commentChange()]), ctx)
+
+    await echo.handle(
+      event(2, [
+        commentChange({
+          messageId: 'm2',
+          body: 'Actually make it shorter.',
+        }),
+      ]),
+      ctx,
+    )
+
+    const intent = Object.values((kv.room as RoomState).intents)[0]!
+    expect(intent.version).toBe(2)
+    expect(comments.replies).toHaveLength(2)
+  })
+
+  test('selections never call the model or post a reply', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'nope' }))
+    const comments = fakeComments()
+    const { ctx } = harness({ llm: spy.llm, comments })
+    await echo.handle(
+      event(1, [
+        {
+          surface: 'selection',
+          change: 'selected',
+          peerId: 'peer-1',
+          principal: 'person-1',
+          displayName: 'Person',
+          driver: 'Browser',
+          blockId: 'b1',
+          kind: 'selection',
+          startUtf16: 0,
+          endUtf16: 3,
+          quote: 'abc',
+          observedAt: '2026-11-10T00:00:00.000Z',
+          actorKind: 'person',
+          priority: 2,
+        },
+      ]),
+      ctx,
+    )
+    expect(spy.calls).toEqual([])
+    expect(comments.replies).toEqual([])
   })
 })

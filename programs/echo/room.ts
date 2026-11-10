@@ -86,6 +86,8 @@ export type RoomState = {
   steps: Record<string, PlanStep>
   targets: Record<string, TargetState>
   selections: Record<string, SelectionEvidence>
+  /** threadId -> last message echo handled, so a redelivered event cannot double-reply. */
+  handledComments: Record<string, string>
 }
 
 export const emptyRoom = (pageId = ''): RoomState => ({
@@ -95,6 +97,7 @@ export const emptyRoom = (pageId = ''): RoomState => ({
   steps: {},
   targets: {},
   selections: {},
+  handledComments: {},
 })
 
 const scopeKey = (scope: TargetScope) =>
@@ -127,6 +130,99 @@ export function findIntentForBlock(room: RoomState, blockId: string): Intent | u
   return Object.values(room.intents).find(
     (intent) => intent.status === 'active' && intent.targetScope.blockId === blockId,
   )
+}
+
+export function attachThreadToIntent(
+  room: RoomState,
+  intentId: string,
+  threadId: string,
+): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent) return room
+  return copyIntents(room, {
+    ...room.intents,
+    [intentId]: { ...intent, targetScope: { ...intent.targetScope, threadId } },
+  })
+}
+
+export function closeIntentForThread(room: RoomState, threadId: string): RoomState {
+  const intent = findIntentForThread(room, threadId)
+  if (!intent) return room
+  return copyIntents(room, {
+    ...room.intents,
+    [intent.id]: { ...intent, status: 'abandoned' },
+  })
+}
+
+export function commentHandled(room: RoomState, threadId: string, messageId: string): boolean {
+  return room.handledComments[threadId] === messageId
+}
+
+export function markCommentHandled(
+  room: RoomState,
+  threadId: string,
+  messageId: string,
+): RoomState {
+  return {
+    ...room,
+    handledComments: { ...room.handledComments, [threadId]: messageId },
+  }
+}
+
+/**
+ * Applies a triage decision to the room. Body changes already bumped their
+ * intent in recordBodyChange; comment changes pass `bump: true`.
+ */
+export function applyTriage(
+  room: RoomState,
+  input: {
+    intentId: string | null
+    kind: IntentKind | null
+    targetScope: TargetScope
+    confidence: number
+    evidence: EvidenceRef
+  },
+  now: string,
+  bump: boolean,
+): RoomState {
+  if (input.kind === null) return room
+  const intent =
+    (input.intentId && room.intents[input.intentId]) ||
+    (input.targetScope.threadId && findIntentForThread(room, input.targetScope.threadId)) ||
+    (input.targetScope.nodeKey && findActiveIntentForTarget(room, input.targetScope.nodeKey)) ||
+    (input.targetScope.blockId && findIntentForBlock(room, input.targetScope.blockId)) ||
+    undefined
+  if (!intent) {
+    const admitted = admitIntent(
+      room,
+      {
+        kind: input.kind,
+        targetScope: input.targetScope,
+        outputKind: 'comment',
+        confidence: input.confidence,
+        evidence: [input.evidence],
+      },
+      now,
+    )
+    return admitted.room
+  }
+  const based = bump ? bumpIntentVersion(room, intent.id, input.evidence, now) : room
+  const current = based.intents[intent.id] ?? intent
+  const evidence = bump
+    ? current.evidence
+    : current.evidence.some((ref) => ref.eventId === input.evidence.eventId)
+      ? current.evidence
+      : [...current.evidence, input.evidence]
+  return copyIntents(based, {
+    ...based.intents,
+    [intent.id]: {
+      ...current,
+      kind: input.kind,
+      confidence: input.confidence,
+      evidence,
+      updatedAt: now,
+    },
+  })
 }
 
 export function admitIntent(
@@ -279,22 +375,13 @@ export function recordBodyChange(
   const prior = room.targets[target.key]
   const generation = (prior?.generation ?? 0) + 1
   const existing = findActiveIntentForTarget(room, target.key)
+  // Triage decides whether this change is an action, correction, chat or
+  // ignore, and creates the intent. Here we only carry the fence forward.
   if (!existing) {
-    const admitted = admitIntent(
-      room,
-      {
-        kind: 'action',
-        targetScope: { pageId: target.pageId, blockId: target.blockId, nodeKey: target.key },
-        outputKind: 'comment',
-        confidence: 1,
-        evidence: [evidence],
-      },
-      now,
-    )
-    return recordTarget(admitted.room, {
+    return recordTarget(room, {
       ...target,
       generation,
-      assumedIntentVersion: admitted.intent.version,
+      assumedIntentVersion: null,
     })
   }
   const bumped = bumpIntentVersion(room, existing.id, evidence, now)

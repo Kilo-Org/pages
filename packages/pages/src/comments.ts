@@ -67,3 +67,33 @@ export async function editComment(client: PagesClient, input: EditCommentInput):
   const receipt = v.parse(CommentReceipt, raw)
   return { threadId: receipt.result.thread_id, messageId: receipt.result.message_id }
 }
+
+export type ReplyCommentInput = {
+  pageId: string
+  threadId: string
+  body: string
+  /** Usually the message being answered; feeds the idempotency key. */
+  dedupeOn: string
+}
+
+/**
+ * Replies in an existing thread. The action is part of the key so a reply and
+ * an edit with the same dedupe text can never collide.
+ */
+export async function replyToComment(client: PagesClient, input: ReplyCommentInput): Promise<AddBlockCommentResult> {
+  const idempotency_key = await idempotencyKey([
+    input.pageId,
+    input.threadId,
+    'reply',
+    input.dedupeOn,
+  ])
+  const raw = await client.call('manage_page_comment', {
+    page_id: input.pageId,
+    idempotency_key,
+    action: 'reply',
+    thread_id: input.threadId,
+    body: input.body,
+  })
+  const receipt = v.parse(CommentReceipt, raw)
+  return { threadId: receipt.result.thread_id, messageId: receipt.result.message_id }
+}
