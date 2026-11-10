@@ -5,6 +5,19 @@ import {
   type ProgramContext,
   type SelectionChange,
 } from '@pages-programs/sdk'
+import {
+  clearSelection,
+  commitIsCurrent,
+  emptyRoom,
+  migrateNodes,
+  noteSelection,
+  recordBodyChange,
+  recordCommentEvidence,
+  recordTarget,
+  removeTarget,
+  type RoomState,
+  type TargetState,
+} from './room.ts'
 
 export type TextDelta = { removed: string; added: string }
 
@@ -35,27 +48,56 @@ const MIN_CHARS = 3
 /** Backoff after a failed attempt starts at SPECULATIVE_PAUSE_MS and doubles, capped here. */
 const MAX_BACKOFF_MS = 5 * 60_000
 
-type NodeRecord = {
-  blockId: string
-  text: string
-  changedAt: number
-  /** The exact text we last completed an attempt for — null means "not evaluated yet". */
-  evaluatedText: string | null
-  /** Consecutive decide/reply failures for the current `text`. Resets on success or on a new edit. */
-  failures: number
-  /** When we last attempted this `text`, for backoff gating. 0 means never attempted. */
-  lastAttemptAt: number
-  /** Set once echo has replied to this node — further updates edit this same message. */
-  threadId: string | null
-  messageId: string | null
-  /** The reply text currently posted, fed back into the prompt so a correction is coherent. */
-  lastReply: string | null
+const ROOM_KEY = 'room'
+const ROOM_LOCK = 'room-lock'
+
+/** Reads the room, upgrading PR 3's flat `nodes/*` records once. */
+async function loadRoom(ctx: ProgramContext, pageId = ''): Promise<RoomState> {
+  const stored = await ctx.state.get<RoomState>(ROOM_KEY)
+  if (stored && stored.schemaVersion === 1) return stored
+  const records: Record<string, unknown> = {}
+  for (const key of await ctx.state.list('nodes/')) records[key] = await ctx.state.get(key)
+  if (Object.keys(records).length === 0) return emptyRoom(pageId || stored?.pageId || '')
+  return migrateNodes(records, pageId || stored?.pageId || '')
 }
 
-/** Builds the record for `text`, preserving reply identity across edits (`prior`'s thread/message/reply). */
-function withText(prior: NodeRecord | undefined, blockId: string, text: string): NodeRecord {
+/**
+ * Serializes room load/mutate/save inside one instance. The lock covers the
+ * commit check + write, not the model call, so one slow draft does not block
+ * other targets.
+ */
+async function updateRoom<T>(
+  ctx: ProgramContext,
+  pageId: string | undefined,
+  fn: (room: RoomState) => Promise<{ room: RoomState; value: T }> | { room: RoomState; value: T },
+): Promise<T> {
+  const previous = ctx.scratch.get<Promise<unknown>>(ROOM_LOCK) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  const tail = previous.then(() => gate, () => gate)
+  ctx.scratch.set(ROOM_LOCK, tail)
+  await previous.catch(() => {})
+  try {
+    const room = await loadRoom(ctx, pageId)
+    const next = await fn(room)
+    await ctx.state.set(ROOM_KEY, next.room)
+    return next.value
+  } finally {
+    release()
+  }
+}
+
+/** Builds the target for `text`, preserving reply identity across edits. */
+function withText(
+  prior: TargetState | undefined,
+  pageId: string,
+  change: BodyChange,
+  text: string,
+): TargetState {
   return {
-    blockId,
+    key: nodeKey(change),
+    pageId,
+    blockId: change.blockId,
     text,
     changedAt: Date.now(),
     evaluatedText: null,
@@ -64,6 +106,8 @@ function withText(prior: NodeRecord | undefined, blockId: string, text: string):
     threadId: prior?.threadId ?? null,
     messageId: prior?.messageId ?? null,
     lastReply: prior?.lastReply ?? null,
+    generation: prior?.generation ?? 0,
+    assumedIntentVersion: prior?.assumedIntentVersion ?? null,
   }
 }
 
@@ -115,23 +159,34 @@ function isAbortError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError'
 }
 
-async function describe(change: BodyChange, ctx: ProgramContext): Promise<string | null> {
+async function describe(
+  change: BodyChange,
+  ctx: ProgramContext,
+  pageId: string,
+  eventId: string,
+  at: string,
+): Promise<string | null> {
   if (change.scope === 'block') return `block ${change.blockId.slice(0, 8)} ${change.change}`
   const key = nodeKey(change)
   if (change.change === 'deleted') {
-    await ctx.state.delete(key)
     abortSpeculative(ctx, key)
+    await updateRoom(ctx, pageId, (room) => ({ room: removeTarget(room, key), value: undefined }))
     return `deleted ${change.type ?? 'node'}`
   }
   const after = change.markdown ?? ''
-  // A stale pre-upgrade state file holds a plain string here instead of a NodeRecord. Treat
-  // anything that isn't one as "never seen" rather than crash on `.text` of a string/number.
-  const beforeRaw = await ctx.state.get<NodeRecord | unknown>(key)
-  const before = beforeRaw && typeof beforeRaw === 'object' ? (beforeRaw as NodeRecord) : undefined
+  const snapshot = await loadRoom(ctx, pageId)
+  const before = snapshot.targets[key]
   if (after !== before?.text) {
     // New text invalidates any speculative draft that was based on the old text.
     abortSpeculative(ctx, key)
-    await ctx.state.set<NodeRecord>(key, withText(before, change.blockId, after))
+    await updateRoom(ctx, pageId, (room) => {
+      const prior = room.targets[key]
+      const target = withText(prior, pageId, change, after)
+      return {
+        room: recordBodyChange(room, target, { eventId, at }, at),
+        value: undefined,
+      }
+    })
   }
   // Nothing to diff against until the program has seen this node once.
   if (before === undefined) return `first sight of ${change.type ?? 'node'}: ${JSON.stringify(after)}`
@@ -156,43 +211,69 @@ const backoffFor = (failures: number) =>
   failures === 0 ? 0 : Math.min(SPECULATIVE_PAUSE_MS * 2 ** Math.min(failures - 1, 10), MAX_BACKOFF_MS)
 
 /**
- * The speculative attempt: decide, then commit only if the text it was based on still matches —
- * that re-read is the actual correctness guarantee; the abort signal above is just the
- * performance optimization that avoids paying for (and waiting on) drafts that get thrown away.
+ * The speculative attempt: decide, then commit only if the text, generation,
+ * and intent version it was based on still match. The commit check runs inside
+ * the room lock, immediately before the write.
  */
-async function attempt(key: string, base: NodeRecord, ctx: ProgramContext, signal: AbortSignal): Promise<void> {
+async function attempt(key: string, base: TargetState, ctx: ProgramContext, signal: AbortSignal): Promise<void> {
   const system = base.threadId ? FOLLOWUP_SYSTEM_PROMPT : SYSTEM_PROMPT
   const prompt = base.threadId ? `Previous reply: ${JSON.stringify(base.lastReply)}\n\nCurrent text: ${base.text}` : base.text
   try {
     const raw = await ctx.llm!.complete({ system, prompt, signal })
     const decision = parseDecision(raw)
-    const fresh = await ctx.state.get<NodeRecord>(key)
-    if (!fresh || fresh.text !== base.text) {
-      ctx.log(`draft for ${base.blockId.slice(0, 8)} discarded: text moved on before it was ready`)
-      return
-    }
-    let { threadId, messageId, lastReply } = fresh
-    if (decision.respond && decision.reply) {
-      if (threadId && messageId) {
-        await ctx.comments!.editMessage({ threadId, messageId, body: decision.reply, dedupeOn: fresh.text })
-        ctx.log(`updated reply in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
-      } else {
-        const posted = await ctx.comments!.addBlock({ blockId: fresh.blockId, body: decision.reply, dedupeOn: fresh.text })
-        threadId = posted.threadId
-        messageId = posted.messageId
-        ctx.log(`replied in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
+    const outcome = await updateRoom(ctx, undefined, async (room) => {
+      const fresh = room.targets[key]
+      const current = commitIsCurrent(room, key, {
+        text: base.text,
+        intentVersion: base.assumedIntentVersion,
+        generation: base.generation,
+      })
+      if (!fresh || !current) return { room, value: 'discarded' as const }
+      let { threadId, messageId, lastReply } = fresh
+      if (decision.respond && decision.reply) {
+        if (threadId && messageId) {
+          await ctx.comments!.editMessage({ threadId, messageId, body: decision.reply, dedupeOn: fresh.text })
+          ctx.log(`updated reply in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
+        } else {
+          const posted = await ctx.comments!.addBlock({ blockId: fresh.blockId, body: decision.reply, dedupeOn: fresh.text })
+          threadId = posted.threadId
+          messageId = posted.messageId
+          ctx.log(`replied in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
+        }
+        lastReply = decision.reply
       }
-      lastReply = decision.reply
+      return {
+        room: recordTarget(room, {
+          ...fresh,
+          evaluatedText: fresh.text,
+          failures: 0,
+          lastAttemptAt: Date.now(),
+          threadId,
+          messageId,
+          lastReply,
+        }),
+        value: 'written' as const,
+      }
+    })
+    if (outcome === 'discarded') {
+      ctx.log(`draft for ${base.blockId.slice(0, 8)} discarded: text or intent moved on before it was ready`)
     }
-    await ctx.state.set<NodeRecord>(key, { ...fresh, evaluatedText: fresh.text, failures: 0, lastAttemptAt: Date.now(), threadId, messageId, lastReply })
   } catch (error) {
     if (isAbortError(error)) return // intentional cancel — not a failure, nothing to record
-    const fresh = (await ctx.state.get<NodeRecord>(key)) ?? base
+    const snapshot = await loadRoom(ctx)
+    const fresh = snapshot.targets[key] ?? base
     const failures = fresh.failures + 1
     const message = error instanceof Error ? error.message : String(error)
     ctx.log(`decide/reply failed (attempt ${failures}), backing off ${backoffFor(failures)}ms: ${message}`)
     // Don't mark evaluated — retry later, at an increasing delay, instead of giving up or hot-looping.
-    await ctx.state.set<NodeRecord>(key, { ...fresh, failures, lastAttemptAt: Date.now() })
+    await updateRoom(ctx, undefined, (room) => {
+      const target = room.targets[key]
+      if (!target) return { room, value: undefined }
+      return {
+        room: recordTarget(room, { ...target, failures, lastAttemptAt: Date.now() }),
+        value: undefined,
+      }
+    })
   }
 }
 
@@ -218,24 +299,33 @@ export default defineProgram({
     if (event.titleChanged) ctx.log(`title → ${JSON.stringify(event.title)}`)
     for (const change of event.changes) {
       if (change.surface === 'comment') {
+        await updateRoom(ctx, event.pageId, (room) => ({
+          room: recordCommentEvidence(room, change, event.id, event.at),
+          value: undefined,
+        }))
         ctx.log(describeComment(change))
         continue
       }
       if (change.surface === 'selection') {
+        await updateRoom(ctx, event.pageId, (room) => ({
+          room:
+            change.change === 'cleared'
+              ? clearSelection(room, change.peerId)
+              : noteSelection(room, change),
+          value: undefined,
+        }))
         ctx.log(describeSelection(change))
         continue
       }
-      const line = await describe(change, ctx)
+      const line = await describe(change, ctx, event.pageId, event.id, event.at)
       if (line) ctx.log(line)
     }
   },
   async tick(ctx) {
     if (!ctx.llm || !ctx.comments) return // no model/write capability configured — nothing to do
+    const room = await loadRoom(ctx)
     const now = Date.now()
-    for (const key of await ctx.state.list('nodes/')) {
-      const record = await ctx.state.get<NodeRecord>(key)
-      if (!record || typeof record !== 'object') continue
-
+    for (const [key, record] of Object.entries(room.targets)) {
       const inFlight = ctx.scratch.get<SpeculativeAttempt>(key)
       if (inFlight) {
         if (inFlight.baseText !== record.text) abortSpeculative(ctx, key)

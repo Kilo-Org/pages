@@ -88,6 +88,28 @@ The same poll also watches the page's two other user surfaces:
   selection epoch, so comment-only and selection-only events deduplicate
   correctly across redeliveries while body-only ids stay stable.
 
+## The room
+
+Echo keeps one `room` value in `ctx.state`: the durable "what is being asked"
+ledger plus the bookkeeping the executor needs.
+
+- `intents` — one per target, with `kind`, `status`, `version`,
+  `targetScope`, `outputKind`, `confidence`, and evidence.
+- `steps` — planned work for an intent. A version bump marks older steps
+  `stale`; they are cancelled only when unowned.
+- `targets` — per-node reply identity (`threadId`/`messageId`/`lastReply`),
+  dedupe text, backoff, and the `generation` / `assumedIntentVersion` fence.
+- `selections` — the latest person selection per peer, used as scope evidence.
+
+A body change creates the target's `action` intent on first sight and bumps
+its version on later change. `attempt()` reads the model outside the room
+lock, then re-checks text, generation, and intent version immediately before
+writing. The lock covers the check and the write, not the model call, so one
+slow draft does not block other targets.
+
+PR 3's flat `nodes/*` records are migrated once into `room.targets` on first
+read. The old keys stay in place so a rollback still has reply identity.
+
 ## Replying to settled text, speculatively
 
 Besides logging, `echo` watches for a block of text that reads like a

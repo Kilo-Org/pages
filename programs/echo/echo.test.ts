@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import echo, { attempt, looksComplete, SPECULATIVE_PAUSE_MS, textDelta } from './index.ts'
+import type { RoomState, TargetState } from './room.ts'
 import type {
   BodyChange,
   CommentsCapability,
@@ -106,6 +107,11 @@ const node = (change: BodyChange['change'], markdown: string | null): BodyChange
   priority: 2,
 })
 
+const nodeAt = (blockId: string, markdown: string): BodyChange => ({
+  ...node('updated', markdown),
+  blockId,
+})
+
 const event = (n: number, changes: PageChange[]): PageChangedEvent => ({
   id: `p@${n}+c:+s:0`,
   type: 'page.changed',
@@ -121,8 +127,19 @@ const event = (n: number, changes: PageChange[]): PageChangedEvent => ({
   changes,
 })
 
+const targetOf = (kv: Record<string, unknown>, key = 'nodes/b1:0') => {
+  const room = kv.room as RoomState | undefined
+  return (room?.targets[key] ?? kv[key]) as TargetState | undefined
+}
+
+const savedTarget = async (ctx: ProgramContext, key = 'nodes/b1:0') => {
+  const room = await ctx.state.get<RoomState>('room')
+  return room?.targets[key] ?? (await ctx.state.get<TargetState>(key))
+}
+
 const backdate = (kv: Record<string, unknown>, key: string, ms: number) => {
-  ;(kv[key] as { changedAt: number }).changedAt = Date.now() - ms
+  const target = targetOf(kv, key)
+  if (target) target.changedAt = Date.now() - ms
 }
 
 /** Lets a fire-and-forget promise chain (tick() never awaits attempt()) fully settle before asserting. */
@@ -185,7 +202,7 @@ describe('echo program', () => {
     kv['nodes/b1:0'] = 'Hello' // the old state shape, before NodeRecord existed
     await echo.handle(event(1, [node('updated', 'Hello world')]), ctx)
     expect(lines).toEqual(['first sight of paragraph: "Hello world"'])
-    expect(kv['nodes/b1:0']).toMatchObject({ text: 'Hello world', evaluatedText: null, failures: 0 })
+    expect(targetOf(kv)).toMatchObject({ text: 'Hello world', evaluatedText: null, failures: 0 })
   })
 
   test('logs comment changes without treating them as node text', async () => {
@@ -209,7 +226,7 @@ describe('echo program', () => {
       ctx,
     )
     expect(lines).toEqual(['comment t1 inserted by Browser: "Can you tighten this?"'])
-    expect(Object.keys(kv)).toEqual([])
+    expect((kv.room as RoomState).targets).toEqual({})
   })
 
   test('logs selection changes without scheduling a reply', async () => {
@@ -236,7 +253,25 @@ describe('echo program', () => {
       ctx,
     )
     expect(lines).toEqual(['selection b1 selected (selection) by Browser: "abc"'])
-    expect(Object.keys(kv)).toEqual([])
+    expect((kv.room as RoomState).targets).toEqual({})
+  })
+
+  test('a body change creates an intent; the next change bumps its version and generation', async () => {
+    const { kv, ctx } = harness()
+    await echo.handle(event(1, [node('updated', 'Question?')]), ctx)
+    const first = kv.room as RoomState
+    const intentId = Object.keys(first.intents)[0]!
+    expect(first.intents[intentId]).toMatchObject({ version: 1, status: 'active' })
+    expect(first.targets['nodes/b1:0']).toMatchObject({ generation: 1, assumedIntentVersion: 1 })
+
+    await echo.handle(event(2, [node('updated', 'Question two?')]), ctx)
+    const second = kv.room as RoomState
+    expect(second.intents[intentId]?.version).toBe(2)
+    expect(second.targets['nodes/b1:0']).toMatchObject({
+      text: 'Question two?',
+      generation: 2,
+      assumedIntentVersion: 2,
+    })
   })
 })
 
@@ -281,7 +316,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     d.resolve({ respond: true, reply: 'Yes.' })
     await flush()
     expect(comments.posts).toEqual([{ blockId: 'b1', body: 'Yes.', dedupeOn: 'Does it work?' }])
-    expect((kv['nodes/b1:0'] as { evaluatedText: string | null }).evaluatedText).toBe('Does it work?')
+    expect(targetOf(kv)?.evaluatedText).toBe('Does it work?')
   })
 
   test('a text change before the draft resolves aborts it — nothing posts even once it later settles', async () => {
@@ -346,6 +381,26 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     expect(d.calls).toBe(1)
   })
 
+  test('two in-flight drafts on different nodes commit without clobbering the room', async () => {
+    const d = deferredLlm()
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm: d.llm, comments })
+    await echo.handle(event(1, [nodeAt('b1', 'First?'), nodeAt('b2', 'Second?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+    expect(d.calls).toBe(2)
+
+    d.resolve({ respond: true, reply: 'One.' }, 0)
+    d.resolve({ respond: true, reply: 'Two.' }, 1)
+    await flush()
+
+    const room = kv.room as RoomState
+    expect(Object.keys(room.targets).sort()).toEqual(['nodes/b1:0', 'nodes/b2:0'])
+    expect(room.targets['nodes/b1:0']?.evaluatedText).toBe('First?')
+    expect(room.targets['nodes/b2:0']?.evaluatedText).toBe('Second?')
+    expect(comments.posts).toHaveLength(2)
+  })
+
   test('skips text below the length gate — never asks the model', async () => {
     const d = deferredLlm()
     const { kv, ctx } = harness({ llm: d.llm, comments: fakeComments() })
@@ -365,7 +420,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     await echo.tick!(ctx)
     await flush()
     expect(comments.posts).toEqual([])
-    expect((kv['nodes/b1:0'] as { evaluatedText: string | null }).evaluatedText).toBe('Just a statement.')
+    expect(targetOf(kv)?.evaluatedText).toBe('Just a statement.')
 
     await echo.tick!(ctx)
     await flush()
@@ -377,7 +432,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
     backdate(kv, 'nodes/b1:0', SPECULATIVE_PAUSE_MS + 500)
     await echo.tick!(ctx)
-    expect((kv['nodes/b1:0'] as { evaluatedText: string | null }).evaluatedText).toBeNull()
+    expect(targetOf(kv)?.evaluatedText).toBeNull()
   })
 
   test('a further edit after a reply updates the same thread in place, end to end', async () => {
@@ -412,7 +467,7 @@ describe('echo tick — backoff after a genuine failure', () => {
     const { kv, ctx } = harness({ llm, comments })
     await echo.handle(event(1, [node('updated', 'Will this ever work?')]), ctx)
     backdate(kv, 'nodes/b1:0', SPECULATIVE_PAUSE_MS + 500)
-    const record = () => kv['nodes/b1:0'] as { failures: number; lastAttemptAt: number }
+    const record = () => targetOf(kv) as { failures: number; lastAttemptAt: number }
 
     await echo.tick!(ctx)
     await flush() // failures: 0 -> 1, backoff ~SPECULATIVE_PAUSE_MS
@@ -443,6 +498,8 @@ describe('echo tick — backoff after a genuine failure', () => {
 describe('attempt() — commit fence, and first reply vs. correction (Part A fence + Part B)', () => {
   function record(overrides: Partial<Parameters<typeof attempt>[1]>) {
     return {
+      key: 'nodes/b1:0',
+      pageId: 'p',
       blockId: 'b1',
       text: 'placeholder',
       changedAt: Date.now(),
@@ -452,6 +509,8 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
       threadId: null,
       messageId: null,
       lastReply: null,
+      generation: 1,
+      assumedIntentVersion: 1,
       ...overrides,
     }
   }
@@ -475,7 +534,7 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
     expect(comments.posts).toEqual([{ blockId: 'b1', body: 'Yes, this works.', dedupeOn: 'Does it work?' }])
     expect(comments.edits).toEqual([])
-    const saved = await ctx.state.get('nodes/b1:0')
+    const saved = await savedTarget(ctx)
     expect(saved).toMatchObject({ threadId: 'thread-1', messageId: 'message-1', lastReply: 'Yes, this works.', evaluatedText: 'Does it work?' })
   })
 
@@ -491,7 +550,7 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
     expect(comments.posts).toEqual([])
     expect(comments.edits).toEqual([{ threadId: 'thread-1', messageId: 'message-1', body: 'Yes, definitely.', dedupeOn: 'Does it really work?' }])
-    const saved = await ctx.state.get('nodes/b1:0')
+    const saved = await savedTarget(ctx)
     expect(saved).toMatchObject({ lastReply: 'Yes, definitely.', threadId: 'thread-1', messageId: 'message-1' })
   })
 
@@ -509,7 +568,7 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
     expect(comments.posts).toEqual([])
     expect(comments.edits).toEqual([])
-    const saved = await ctx.state.get('nodes/b1:0')
+    const saved = await savedTarget(ctx)
     expect(saved).toMatchObject({ threadId: 'thread-1', messageId: 'message-1', lastReply: 'Yes, this works.', evaluatedText: base.text })
   })
 
@@ -525,7 +584,7 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     const base = record({ text: 'new text', threadId: 'thread-1', messageId: 'message-1', lastReply: 'old reply' })
     await ctx.state.set('nodes/b1:0', base)
     await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
-    const saved = await ctx.state.get('nodes/b1:0')
+    const saved = await savedTarget(ctx)
     expect(saved).toMatchObject({ failures: 1, evaluatedText: null }) // not marked evaluated — will retry
   })
 
@@ -541,7 +600,7 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     const base = record({ text: 'x' })
     await ctx.state.set('nodes/b1:0', base)
     await attempt('nodes/b1:0', base, ctx, controller.signal)
-    const saved = await ctx.state.get('nodes/b1:0')
+    const saved = await savedTarget(ctx)
     expect(saved).toEqual(base) // untouched — abort isn't a failure
   })
 })
