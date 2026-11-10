@@ -39,9 +39,21 @@ export type ProgramState = {
   list(prefix: string): Promise<string[]>
 }
 
+/**
+ * In-memory only, never persisted: for coordination objects (AbortControllers, base-text
+ * snapshots for speculative work) that make no sense on disk and shouldn't survive a restart.
+ * Fresh per `runProgram` instance, so no leakage between pages watched by the same program.
+ */
+export type ScratchState = {
+  get<T>(key: string): T | undefined
+  set<T>(key: string, value: T): void
+  delete(key: string): void
+}
+
 /** One inference call. The host supplies the model and credentials; a program only sees this. */
 export type LlmCapability = {
-  complete(input: { system: string; prompt: string }): Promise<string>
+  /** `signal`, if given, aborts the underlying request — for discarding stale speculative work. */
+  complete(input: { system: string; prompt: string; signal?: AbortSignal }): Promise<string>
 }
 
 /** Comment writes. The host supplies the Pages client and credentials. */
@@ -51,11 +63,19 @@ export type CommentsCapability = {
    * deterministic idempotency key, so retrying with the same blockId + dedupeOn never double-posts.
    */
   addBlock(input: { blockId: string; body: string; dedupeOn: string }): Promise<{ threadId: string; messageId: string }>
+  /** Edits an existing message in place (only the message's own author may). Same idempotency approach. */
+  editMessage(input: {
+    threadId: string
+    messageId: string
+    body: string
+    dedupeOn: string
+  }): Promise<{ threadId: string; messageId: string }>
 }
 
 export type ProgramContext = {
   log(message: string, data?: Record<string, unknown>): void
   state: ProgramState
+  scratch: ScratchState
   /** Present only when the host was given an LLM capability (e.g. KILO_API_KEY is set). */
   llm?: LlmCapability
   comments?: CommentsCapability

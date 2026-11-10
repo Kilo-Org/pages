@@ -100,7 +100,8 @@ default.
 | Forget saved cursors and state | `--fresh` | | | off |
 | API key (bearer) | | `PAGES_TOKEN` | | unset: local sign-in |
 | Kilo AI Gateway key | | `KILO_API_KEY` | | unset: `ctx.llm` absent, programs that use it no-op |
-| Kilo model id | | `KILO_MODEL` | | `kilo-auto/free` (a free model — set this to a paid one once your Kilo account has credits) |
+| Kilo model id | | `KILO_MODEL` | | `anthropic/claude-haiku-5.5` (fast/cheap; set `KILO_MODEL=kilo-auto/free` if your account has no credits) |
+| Kilo org id | | `KILO_ORG_ID` | | unset. Needed if your `KILO_API_KEY` is shared across multiple orgs — scopes the request to the one with the balance you want to use. Find it in the app.kilo.ai URL after selecting that org. |
 
 The port is not discovered. `localhost:9894` is only the default origin, so
 point `--origin` at an instance running elsewhere.

@@ -12,9 +12,10 @@ const PROGRAMS_DIR = 'programs'
 const STATE_DIR = '.state'
 const DEFAULT_ORIGIN = 'http://localhost:9894'
 const DEFAULT_INTERVAL_MS = 400
-// A free model, so this works with no Kilo credits/balance out of the box.
-// Set KILO_MODEL for a paid model once your Kilo account has credits.
-const DEFAULT_KILO_MODEL = 'kilo-auto/free'
+// Fast and cheap, not frontier — latency matters more than raw capability here,
+// since the whole point is a quick yes/no + short reply. Set KILO_MODEL to override
+// (e.g. back to 'kilo-auto/free' if your Kilo account has no credits).
+const DEFAULT_KILO_MODEL = 'anthropic/claude-haiku-5.5'
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -65,7 +66,7 @@ if (command === 'list') {
   const client = createPagesClient({ origin, auth: token ? bearerAuth(token) : localOidcAuth(origin) })
   const kiloApiKey = process.env.KILO_API_KEY
   const llm = kiloApiKey
-    ? createKiloLlm({ apiKey: kiloApiKey, model: process.env.KILO_MODEL ?? DEFAULT_KILO_MODEL })
+    ? createKiloLlm({ apiKey: kiloApiKey, model: process.env.KILO_MODEL ?? DEFAULT_KILO_MODEL, orgId: process.env.KILO_ORG_ID })
     : undefined
   if (!llm) log('KILO_API_KEY not set: programs that need ctx.llm will skip those decisions')
 
