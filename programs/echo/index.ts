@@ -22,6 +22,8 @@ const nodeKey = (change: NodeChange) => `nodes/${change.blockId}:${change.nodeId
 const QUIET_MS = 8_000
 /** Below this many trimmed characters, don't bother asking the model. */
 const MIN_CHARS = 3
+/** Backoff after a failed attempt starts at QUIET_MS and doubles, capped here. */
+const MAX_BACKOFF_MS = 5 * 60_000
 
 type NodeRecord = {
   blockId: string
@@ -29,7 +31,20 @@ type NodeRecord = {
   changedAt: number
   /** The exact text we last asked the model about — null means "not evaluated yet". */
   evaluatedText: string | null
+  /** Consecutive decide/reply failures for the current `text`. Resets on success or on a new edit. */
+  failures: number
+  /** When we last attempted this `text`, for backoff gating. 0 means never attempted. */
+  lastAttemptAt: number
 }
+
+const newRecord = (blockId: string, text: string): NodeRecord => ({
+  blockId,
+  text,
+  changedAt: Date.now(),
+  evaluatedText: null,
+  failures: 0,
+  lastAttemptAt: 0,
+})
 
 const SYSTEM_PROMPT = [
   'You watch one block of text on a collaborative page. The author just stopped typing.',
@@ -64,10 +79,12 @@ async function describe(change: NodeChange, ctx: ProgramContext): Promise<string
     return `deleted ${change.type ?? 'node'}`
   }
   const after = change.markdown ?? ''
-  // A stale pre-upgrade state file holds a plain string here instead of a NodeRecord — `--fresh` clears those.
-  const before = await ctx.state.get<NodeRecord>(key)
+  // A stale pre-upgrade state file holds a plain string here instead of a NodeRecord. Treat
+  // anything that isn't one as "never seen" rather than crash on `.text` of a string/number.
+  const beforeRaw = await ctx.state.get<NodeRecord | unknown>(key)
+  const before = beforeRaw && typeof beforeRaw === 'object' ? (beforeRaw as NodeRecord) : undefined
   if (after !== before?.text) {
-    await ctx.state.set<NodeRecord>(key, { blockId: change.blockId, text: after, changedAt: Date.now(), evaluatedText: null })
+    await ctx.state.set<NodeRecord>(key, newRecord(change.blockId, after))
   }
   // Nothing to diff against until the program has seen this node once.
   if (before === undefined) return `first sight of ${change.type ?? 'node'}: ${JSON.stringify(after)}`
@@ -79,20 +96,25 @@ async function describe(change: NodeChange, ctx: ProgramContext): Promise<string
   return `${parts.join(' ')}  → ${JSON.stringify(after)}`
 }
 
+/** Exponential backoff after `failures` consecutive attempts, starting at QUIET_MS, capped at MAX_BACKOFF_MS. */
+const backoffFor = (failures: number) => (failures === 0 ? 0 : Math.min(QUIET_MS * 2 ** Math.min(failures - 1, 10), MAX_BACKOFF_MS))
+
 async function evaluate(key: string, record: NodeRecord, ctx: ProgramContext): Promise<void> {
-  let decision: Decision
   try {
     const raw = await ctx.llm!.complete({ system: SYSTEM_PROMPT, prompt: record.text })
-    decision = parseDecision(raw)
+    const decision = parseDecision(raw)
+    if (decision.respond && decision.reply) {
+      const { threadId } = await ctx.comments!.addBlock({ blockId: record.blockId, body: decision.reply, dedupeOn: record.text })
+      ctx.log(`replied in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
+    }
+    await ctx.state.set<NodeRecord>(key, { ...record, evaluatedText: record.text, failures: 0, lastAttemptAt: Date.now() })
   } catch (error) {
-    ctx.log(`decide failed, will retry next tick: ${error instanceof Error ? error.message : String(error)}`)
-    return // don't mark evaluated — retry on the next tick instead of giving up silently
+    const failures = record.failures + 1
+    const message = error instanceof Error ? error.message : String(error)
+    ctx.log(`decide/reply failed (attempt ${failures}), backing off ${backoffFor(failures)}ms: ${message}`)
+    // Don't mark evaluated — retry later, at an increasing delay, instead of giving up or hot-looping.
+    await ctx.state.set<NodeRecord>(key, { ...record, failures, lastAttemptAt: Date.now() })
   }
-  if (decision.respond && decision.reply) {
-    const { threadId } = await ctx.comments!.addBlock({ blockId: record.blockId, body: decision.reply, dedupeOn: record.text })
-    ctx.log(`replied in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
-  }
-  await ctx.state.set<NodeRecord>(key, { ...record, evaluatedText: record.text })
 }
 
 export default defineProgram({
@@ -114,6 +136,7 @@ export default defineProgram({
       if (record.evaluatedText === record.text) continue
       if (record.text.trim().length < MIN_CHARS) continue
       if (now - record.changedAt < QUIET_MS) continue
+      if (record.lastAttemptAt && now - record.lastAttemptAt < backoffFor(record.failures)) continue
       await evaluate(key, record, ctx)
     }
   },

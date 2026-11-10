@@ -140,4 +140,63 @@ describe('runProgram', () => {
     })
     expect(seen).toEqual([{ hasLlm: true, hasComments: true }])
   })
+
+  test('a throwing tick does not advance the cursor until it succeeds, and does not re-run handle() for the already-seen event', async () => {
+    const controller = new AbortController()
+    const handledIds: string[] = []
+    const savedHeadsLog: string[][] = []
+    let tickCalls = 0
+    const program = defineProgram({
+      manifest: { name: 't', triggers: ['page.changed'] },
+      key: (e) => e.pageId,
+      handle: async (e) => void handledIds.push(e.id),
+      tick: async () => {
+        tickCalls++
+        if (tickCalls < 3) throw new Error('tick boom')
+        controller.abort()
+      },
+    })
+    let saved: SavedInstance | undefined
+    const store = {
+      load: async () => saved,
+      save: async (next: SavedInstance) => {
+        saved = next
+        savedHeadsLog.push(next.cursor.heads)
+      },
+    }
+    const { client } = fakePages({ read_page: [opened], read_page_changes: [changes(['h1'], ['a'])] })
+    await runProgram({
+      program, client, pageId: 'p', store, intervalMs: 1,
+      signal: controller.signal, log: () => {},
+    })
+    // handle() ran exactly once: lastEventId already matched on the retries while tick kept failing.
+    expect(handledIds).toEqual(['p@h1'])
+    expect(tickCalls).toBe(3)
+    // Only the startup persist (h0) and the final successful one (h1) happened — nothing in between,
+    // i.e. the cursor was never advanced on disk while tick kept throwing.
+    expect(savedHeadsLog).toEqual([['h0'], ['h1']])
+  })
+
+  test('tick that changes nothing does not persist on every poll', async () => {
+    const controller = new AbortController()
+    let tickCalls = 0
+    const program = defineProgram({
+      manifest: { name: 't', triggers: ['page.changed'] },
+      key: (e) => e.pageId,
+      handle: async () => {},
+      tick: async () => {
+        tickCalls++
+        if (tickCalls >= 5) controller.abort()
+      },
+    })
+    let saveCalls = 0
+    const store = { load: async () => undefined, save: async () => void saveCalls++ }
+    const { client } = fakePages({ read_page: [opened], read_page_changes: [changes(['h0'], [])] })
+    await runProgram({
+      program, client, pageId: 'p', store, intervalMs: 1,
+      signal: controller.signal, log: () => {},
+    })
+    expect(tickCalls).toBe(5)
+    expect(saveCalls).toBe(1) // only the initial startup persist — no event, no resync, no state mutation
+  })
 })

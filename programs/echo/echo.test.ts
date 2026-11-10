@@ -155,7 +155,7 @@ describe('echo tick (reply to settled text)', () => {
     expect(comments.posts[1]).toMatchObject({ dedupeOn: 'Question two?' })
   })
 
-  test('a failed model call is not marked evaluated, so the next tick retries', async () => {
+  test('a failed model call backs off instead of retrying on the very next tick', async () => {
     let calls = 0
     const comments = fakeComments()
     const llm = fakeLlm(() => {
@@ -168,10 +168,53 @@ describe('echo tick (reply to settled text)', () => {
 
     await echo.tick!(ctx)
     expect(comments.posts).toEqual([])
-    expect((kv['nodes/b1:0'] as { evaluatedText: string | null }).evaluatedText).toBeNull()
+    const record = kv['nodes/b1:0'] as { evaluatedText: string | null; failures: number; lastAttemptAt: number }
+    expect(record.evaluatedText).toBeNull()
+    expect(record.failures).toBe(1)
 
+    // Immediately retrying is a no-op: still backing off (QUIET_MS after one failure).
+    await echo.tick!(ctx)
+    expect(calls).toBe(1)
+
+    // Once the backoff window has passed, it retries and succeeds.
+    record.lastAttemptAt = Date.now() - 20_000
     await echo.tick!(ctx)
     expect(comments.posts.length).toBe(1)
+    expect((kv['nodes/b1:0'] as { failures: number }).failures).toBe(0)
+  })
+
+  test('repeated failures back off for longer each time, capped', async () => {
+    const comments = fakeComments()
+    const llm = fakeLlm(() => new Error('still down'))
+    const { kv, ctx } = harness({ llm, comments })
+    await echo.handle(event(1, [node('updated', 'Will this ever work?')]), ctx)
+    backdate(kv, 'nodes/b1:0', 20_000)
+    // `evaluate()` replaces the stored object on each attempt rather than mutating it in place,
+    // so re-read `kv[key]` fresh each time instead of holding a stale reference to it.
+    const record = () => kv['nodes/b1:0'] as { failures: number; lastAttemptAt: number }
+
+    await echo.tick!(ctx) // failures: 0 -> 1, backoff 8s
+    record().lastAttemptAt = Date.now() - 9_000 // past the 8s backoff, so the next tick retries
+    await echo.tick!(ctx) // failures: 1 -> 2, backoff 16s
+    expect(record().failures).toBe(2)
+
+    // 10s later is past the first backoff (8s) but not the second (16s) — still skipped.
+    record().lastAttemptAt = Date.now() - 10_000
+    await echo.tick!(ctx)
+    expect(record().failures).toBe(2)
+
+    // Past 16s, it retries (and fails again).
+    record().lastAttemptAt = Date.now() - 20_000
+    await echo.tick!(ctx)
+    expect(record().failures).toBe(3)
+  })
+
+  test('a stale pre-upgrade state value (a plain string) is treated as unseen, not a crash', async () => {
+    const { lines, kv, ctx } = harness()
+    kv['nodes/b1:0'] = 'Hello' // the old state shape, before NodeRecord existed
+    await echo.handle(event(1, [node('updated', 'Hello world')]), ctx)
+    expect(lines).toEqual(['first sight of paragraph: "Hello world"'])
+    expect(kv['nodes/b1:0']).toMatchObject({ text: 'Hello world', evaluatedText: null, failures: 0 })
   })
 
   test('does nothing when llm/comments capabilities are not configured', async () => {
