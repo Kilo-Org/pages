@@ -99,6 +99,8 @@ default.
 | Override every selected worker's page | `--page ID` | | | |
 | Forget saved cursors and state | `--fresh` | | | off |
 | API key (bearer) | | `PAGES_TOKEN` | | unset: local sign-in |
+| Kilo AI Gateway key | | `KILO_API_KEY` | | unset: `ctx.llm` absent, programs that use it no-op |
+| Kilo model id | | `KILO_MODEL` | | `kilo-auto/free` (a free model — set this to a paid one once your Kilo account has credits) |
 
 The port is not discovered. `localhost:9894` is only the default origin, so
 point `--origin` at an instance running elsewhere.
@@ -128,7 +130,7 @@ at-least-once.
 | `packages/host/src/runtime.ts` loop per instance, in one process | one supervisor Durable Object per (program, page) holding inbox, cursor and alarms |
 | `programs/<name>/index.ts` imported by path | bundled (`Bun.build`, as the check already does), stored by digest, loaded through a Worker Loader |
 | `fleet.yaml` on disk | the same `FleetSpec` created and stored through an API |
-| `ctx` is `log` and `state` | `ctx` also carries capability objects (Pages, tasks) that hold the credentials |
+| `ctx` is `log`, `state`, `llm` and `comments` | `ctx` carries further capability objects (tasks, etc.) that hold the credentials |
 | polling `read_page_changes` | a real event feed from the Pages host, behind the same `page.changed` event |
 
 ## Development

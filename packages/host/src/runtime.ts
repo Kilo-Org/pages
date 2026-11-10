@@ -2,8 +2,8 @@
 // program only ever sees `handle(event, ctx)`. A Durable Object supervisor would
 // replace this file; the Program contract and the page source stay as they are.
 import type { PagesClient } from '@pages-programs/pages'
-import { openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
-import type { Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
+import { addBlockComment, openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
+import type { LlmCapability, Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
 
 export type SavedInstance = {
   cursor: PageCursor
@@ -24,6 +24,8 @@ export type RunOptions = {
   intervalMs: number
   signal: AbortSignal
   log(line: string): void
+  /** Present only when the host has model credentials configured (e.g. KILO_API_KEY). */
+  llm?: LlmCapability
   /** Resolves when the program has handled this many events (tests and demos). */
   stopAfterEvents?: number
 }
@@ -36,14 +38,28 @@ export async function runProgram(options: RunOptions): Promise<void> {
   let lastEventId = saved?.lastEventId ?? null
   let handled = 0
   let failures = 0
+  // Set by ctx.state.set/delete; lets us persist only when something actually changed,
+  // instead of on every poll just because the program defines tick().
+  let kvDirty = false
 
   const ctx: ProgramContext = {
     log: (message, data) => options.log(data ? `${message} ${JSON.stringify(data)}` : message),
     state: {
       get: async <T>(key: string) => kv[key] as T | undefined,
-      set: async (key, value) => void (kv[key] = value),
-      delete: async (key) => void delete kv[key],
+      set: async (key, value) => {
+        kv[key] = value
+        kvDirty = true
+      },
+      delete: async (key) => {
+        if (key in kv) {
+          delete kv[key]
+          kvDirty = true
+        }
+      },
+      list: async (prefix: string) => Object.keys(kv).filter((key) => key.startsWith(prefix)),
     },
+    llm: options.llm,
+    comments: { addBlock: (input) => addBlockComment(client, { pageId, ...input }) },
   }
 
   const persist = () => store.save({ cursor, kv, lastEventId })
@@ -61,9 +77,15 @@ export async function runProgram(options: RunOptions): Promise<void> {
         handled++
       }
       if (result.resynced) options.log('cursor was unknown to the host; resynced to current heads')
-      // Advance the durable cursor only after the handler returned: at-least-once.
+      if (program.tick) await program.tick(ctx)
+      // Advance the durable cursor only once handle/tick have both returned: at-least-once.
+      // If tick throws, this line never runs, so a retry re-polls from the same cursor —
+      // lastEventId still skips re-running handle() for an event already processed.
       cursor = result.cursor
-      if (event || result.resynced) await persist()
+      if (event || result.resynced || kvDirty) {
+        await persist()
+        kvDirty = false
+      }
       if (options.stopAfterEvents !== undefined && handled >= options.stopAfterEvents) return
     } catch (error) {
       failures++

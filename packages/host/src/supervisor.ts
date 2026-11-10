@@ -3,6 +3,7 @@
 // behind; it never takes the others down. A Durable Object per instance
 // replaces this later, keyed the same way: program + page.
 import type { PagesClient } from '@pages-programs/pages'
+import type { LlmCapability } from '@pages-programs/sdk'
 import { clearStore, fileStore } from './file-store.ts'
 import { RECENT_PAGE, type FleetSpec } from './fleet.ts'
 import { loadProgram } from './programs.ts'
@@ -18,6 +19,8 @@ export type UpOptions = {
   signal: AbortSignal
   log(line: string): void
   fresh?: boolean
+  /** Present only when the host has model credentials configured (e.g. KILO_API_KEY). */
+  llm?: LlmCapability
 }
 
 export async function up(options: UpOptions): Promise<void> {
@@ -41,6 +44,7 @@ export async function up(options: UpOptions): Promise<void> {
         intervalMs: options.intervalMs,
         signal: options.signal,
         log,
+        llm: options.llm,
       })
     }),
   )
