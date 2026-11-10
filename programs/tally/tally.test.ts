@@ -11,6 +11,7 @@ test('counts events in state across calls', async () => {
       get: async <T>(key: string) => kv[key] as T | undefined,
       set: async (key, value) => void (kv[key] = value),
       delete: async (key) => void delete kv[key],
+      list: async (prefix) => Object.keys(kv).filter((key) => key.startsWith(prefix)),
     },
   }
   const event = { id: 'p@h1', type: 'page.changed', pageId: 'p', changes: [{}, {}] } as unknown as PageChangedEvent

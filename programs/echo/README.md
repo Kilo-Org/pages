@@ -66,3 +66,34 @@ Who owns which step:
 When Pages gets a real event feed, only the middle of the diagram changes: the poller
 is replaced by a subscription that emits the same `page.changed` event. The program
 does not change.
+
+## Replying to settled text
+
+Besides logging, `echo` watches for a block of text that stops changing and
+reads like a question or request, and replies with a block comment:
+
+```text
+14:46:15.812 [echo:33945932] replied in thread a1b2c3d4: "Yes — ..."
+```
+
+- **Trigger.** `tick(ctx)` runs on every poll (not just when an event
+  arrives — this is how the program notices that typing has *stopped*). A
+  node becomes eligible once its text has sat unchanged for `QUIET_MS`
+  (8s) and is at least a few characters long.
+- **Decision.** One call to `ctx.llm.complete(...)` gets a strict-JSON
+  `{ respond, reply }`. If `respond` is true, `ctx.comments.addBlock(...)`
+  posts `reply` as a new comment on that block.
+- **Dedup.** Each node remembers the exact text it was last evaluated
+  against (`evaluatedText`); the same settled text is never re-evaluated.
+  The comment write itself also carries a deterministic idempotency key
+  (derived from the page, block and text), so a retried write after a
+  crash replays the original receipt instead of posting twice.
+- **No self-reply loop.** `echo` never edits page content, and a comment
+  write never moves the Page's content `heads` — so echo's own reply can
+  never show up as a new `page.changed` event for it to react to.
+- **Requires `KILO_API_KEY`.** Without it, `ctx.llm` is absent and `tick`
+  is a no-op; `echo` still logs diffs as before.
+
+```sh
+KILO_API_KEY=... bun run up echo
+```

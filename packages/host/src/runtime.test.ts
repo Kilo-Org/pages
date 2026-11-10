@@ -119,4 +119,25 @@ describe('runProgram', () => {
     expect(logs.some((l) => l.includes('boom'))).toBe(true)
     expect(store.peek()?.lastEventId).toBe('p@h1')
   })
+
+  test('calls tick every poll, even with no event, with llm/comments wired into ctx', async () => {
+    const controller = new AbortController()
+    const seen: { hasLlm: boolean; hasComments: boolean }[] = []
+    const program = defineProgram({
+      manifest: { name: 't', triggers: ['page.changed'] },
+      key: (e) => e.pageId,
+      handle: async () => {},
+      tick: async (ctx) => {
+        seen.push({ hasLlm: ctx.llm !== undefined, hasComments: typeof ctx.comments?.addBlock === 'function' })
+        controller.abort()
+      },
+    })
+    const store = memoryStore()
+    const { client } = fakePages({ read_page: [opened], read_page_changes: [changes(['h0'], [])] })
+    await runProgram({
+      program, client, pageId: 'p', store, intervalMs: 1,
+      signal: controller.signal, log: () => {}, llm: { complete: async () => 'x' },
+    })
+    expect(seen).toEqual([{ hasLlm: true, hasComments: true }])
+  })
 })

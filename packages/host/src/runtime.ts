@@ -2,8 +2,8 @@
 // program only ever sees `handle(event, ctx)`. A Durable Object supervisor would
 // replace this file; the Program contract and the page source stay as they are.
 import type { PagesClient } from '@pages-programs/pages'
-import { openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
-import type { Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
+import { addBlockComment, openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
+import type { LlmCapability, Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
 
 export type SavedInstance = {
   cursor: PageCursor
@@ -24,6 +24,8 @@ export type RunOptions = {
   intervalMs: number
   signal: AbortSignal
   log(line: string): void
+  /** Present only when the host has model credentials configured (e.g. KILO_API_KEY). */
+  llm?: LlmCapability
   /** Resolves when the program has handled this many events (tests and demos). */
   stopAfterEvents?: number
 }
@@ -43,7 +45,10 @@ export async function runProgram(options: RunOptions): Promise<void> {
       get: async <T>(key: string) => kv[key] as T | undefined,
       set: async (key, value) => void (kv[key] = value),
       delete: async (key) => void delete kv[key],
+      list: async (prefix: string) => Object.keys(kv).filter((key) => key.startsWith(prefix)),
     },
+    llm: options.llm,
+    comments: { addBlock: (input) => addBlockComment(client, { pageId, ...input }) },
   }
 
   const persist = () => store.save({ cursor, kv, lastEventId })
@@ -63,7 +68,12 @@ export async function runProgram(options: RunOptions): Promise<void> {
       if (result.resynced) options.log('cursor was unknown to the host; resynced to current heads')
       // Advance the durable cursor only after the handler returned: at-least-once.
       cursor = result.cursor
-      if (event || result.resynced) await persist()
+      let dirty = Boolean(event) || result.resynced
+      if (program.tick) {
+        await program.tick(ctx)
+        dirty = true
+      }
+      if (dirty) await persist()
       if (options.stopAfterEvents !== undefined && handled >= options.stopAfterEvents) return
     } catch (error) {
       failures++

@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util'
 import { bearerAuth, createPagesClient } from '@pages-programs/pages'
 import { defaultFleet, parseFleet, type FleetSpec } from './fleet.ts'
 import { localOidcAuth } from './local-signin.ts'
+import { createKiloLlm } from './llm.ts'
 import { discoverPrograms, loadProgram } from './programs.ts'
 import { up } from './supervisor.ts'
 
@@ -11,6 +12,9 @@ const PROGRAMS_DIR = 'programs'
 const STATE_DIR = '.state'
 const DEFAULT_ORIGIN = 'http://localhost:9894'
 const DEFAULT_INTERVAL_MS = 400
+// A free model, so this works with no Kilo credits/balance out of the box.
+// Set KILO_MODEL for a paid model once your Kilo account has credits.
+const DEFAULT_KILO_MODEL = 'kilo-auto/free'
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -59,6 +63,11 @@ if (command === 'list') {
   const intervalMs = Number(values.interval ?? fleet.intervalMs ?? DEFAULT_INTERVAL_MS)
   const token = process.env.PAGES_TOKEN
   const client = createPagesClient({ origin, auth: token ? bearerAuth(token) : localOidcAuth(origin) })
+  const kiloApiKey = process.env.KILO_API_KEY
+  const llm = kiloApiKey
+    ? createKiloLlm({ apiKey: kiloApiKey, model: process.env.KILO_MODEL ?? DEFAULT_KILO_MODEL })
+    : undefined
+  if (!llm) log('KILO_API_KEY not set: programs that need ctx.llm will skip those decisions')
 
   const workers = fleet.workers
     .filter((worker) => selected.length === 0 || selected.includes(worker.program))
@@ -77,6 +86,7 @@ if (command === 'list') {
     signal: controller.signal,
     log,
     fresh: values.fresh,
+    llm,
   })
 } else {
   fail(`unknown command "${command}". Use: up [program...] | list`)

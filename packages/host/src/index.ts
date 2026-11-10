@@ -1,4 +1,5 @@
 export * from './fleet.ts'
+export * from './llm.ts'
 export * from './programs.ts'
 export * from './runtime.ts'
 export * from './supervisor.ts'

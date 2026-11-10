@@ -35,11 +35,30 @@ export type ProgramState = {
   get<T>(key: string): Promise<T | undefined>
   set<T>(key: string, value: T): Promise<void>
   delete(key: string): Promise<void>
+  /** Keys with this prefix, for a program that needs to enumerate what it's tracking. */
+  list(prefix: string): Promise<string[]>
+}
+
+/** One inference call. The host supplies the model and credentials; a program only sees this. */
+export type LlmCapability = {
+  complete(input: { system: string; prompt: string }): Promise<string>
+}
+
+/** Comment writes. The host supplies the Pages client and credentials. */
+export type CommentsCapability = {
+  /**
+   * Posts a block-level comment. `dedupeOn` (typically the text being responded to) feeds a
+   * deterministic idempotency key, so retrying with the same blockId + dedupeOn never double-posts.
+   */
+  addBlock(input: { blockId: string; body: string; dedupeOn: string }): Promise<{ threadId: string; messageId: string }>
 }
 
 export type ProgramContext = {
   log(message: string, data?: Record<string, unknown>): void
   state: ProgramState
+  /** Present only when the host was given an LLM capability (e.g. KILO_API_KEY is set). */
+  llm?: LlmCapability
+  comments?: CommentsCapability
 }
 
 export type Program = {
@@ -51,6 +70,8 @@ export type Program = {
   /** Instance key: events with the same key are handled serially with shared state. */
   key(event: ProgramEvent): string
   handle(event: ProgramEvent, ctx: ProgramContext): Promise<void>
+  /** Optional: called every poll tick, even when no event fired. For debounced/timed logic. */
+  tick?(ctx: ProgramContext): Promise<void>
 }
 
 export function defineProgram(program: Program): Program {
