@@ -13,6 +13,7 @@ test('counts events in state across calls', async () => {
       delete: async (key) => void delete kv[key],
       list: async (prefix) => Object.keys(kv).filter((key) => key.startsWith(prefix)),
     },
+    scratch: { get: () => undefined, set: () => {}, delete: () => {} },
   }
   const event = { id: 'p@h1', type: 'page.changed', pageId: 'p', changes: [{}, {}] } as unknown as PageChangedEvent
   await tally.handle(event, ctx)

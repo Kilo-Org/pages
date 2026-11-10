@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { bearerAuth, createPagesClient } from './client.ts'
-import { addBlockComment } from './comments.ts'
+import { addBlockComment, editComment } from './comments.ts'
 
 function fakePages(reply: { status?: number; body: unknown }) {
   const calls: { operation: string; args: Record<string, unknown> }[] = []
@@ -36,5 +36,37 @@ describe('addBlockComment', () => {
     const { client: client3, calls: calls3 } = fakePages({ body: { result: { thread_id: 'th1', message_id: 'm1' } } })
     await addBlockComment(client3, { pageId: 'p', blockId: 'b1', body: 'hello', dedupeOn: 'different text' })
     expect(calls3[0]!.args.idempotency_key).not.toBe(calls1[0]!.args.idempotency_key)
+  })
+})
+
+describe('editComment', () => {
+  test('edits an existing message with thread_id + message_id, no base_heads', async () => {
+    const { client, calls } = fakePages({ body: { result: { thread_id: 'th1', message_id: 'm1' } } })
+    const result = await editComment(client, {
+      pageId: 'p',
+      threadId: 'th1',
+      messageId: 'm1',
+      body: 'updated answer',
+      dedupeOn: 'refined question',
+    })
+    expect(result).toEqual({ threadId: 'th1', messageId: 'm1' })
+    const call = calls[0]!
+    expect(call.operation).toBe('manage_page_comment')
+    expect(call.args).toMatchObject({
+      page_id: 'p',
+      action: 'edit',
+      thread_id: 'th1',
+      message_id: 'm1',
+      body: 'updated answer',
+    })
+    expect(call.args.base_heads).toBeUndefined()
+  })
+
+  test("the idempotency key differs from addBlockComment's, even with the same dedupeOn", async () => {
+    const { client: addClient, calls: addCalls } = fakePages({ body: { result: { thread_id: 'th1', message_id: 'm1' } } })
+    await addBlockComment(addClient, { pageId: 'p', blockId: 'b1', body: 'x', dedupeOn: 'same text' })
+    const { client: editClient, calls: editCalls } = fakePages({ body: { result: { thread_id: 'th1', message_id: 'm1' } } })
+    await editComment(editClient, { pageId: 'p', threadId: 'th1', messageId: 'm1', body: 'y', dedupeOn: 'same text' })
+    expect(editCalls[0]!.args.idempotency_key).not.toBe(addCalls[0]!.args.idempotency_key)
   })
 })

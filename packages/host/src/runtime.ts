@@ -2,7 +2,7 @@
 // program only ever sees `handle(event, ctx)`. A Durable Object supervisor would
 // replace this file; the Program contract and the page source stay as they are.
 import type { PagesClient } from '@pages-programs/pages'
-import { addBlockComment, openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
+import { addBlockComment, editComment, openCursor, pollPage, type PageCursor } from '@pages-programs/pages'
 import type { LlmCapability, Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
 
 export type SavedInstance = {
@@ -41,6 +41,9 @@ export async function runProgram(options: RunOptions): Promise<void> {
   // Set by ctx.state.set/delete; lets us persist only when something actually changed,
   // instead of on every poll just because the program defines tick().
   let kvDirty = false
+  // In-memory only, never persisted — fresh per runProgram() call, so no leakage between
+  // (program, page) instances even though a program module is imported once and reused.
+  const scratch = new Map<string, unknown>()
 
   const ctx: ProgramContext = {
     log: (message, data) => options.log(data ? `${message} ${JSON.stringify(data)}` : message),
@@ -58,8 +61,16 @@ export async function runProgram(options: RunOptions): Promise<void> {
       },
       list: async (prefix: string) => Object.keys(kv).filter((key) => key.startsWith(prefix)),
     },
+    scratch: {
+      get: <T>(key: string) => scratch.get(key) as T | undefined,
+      set: (key, value) => void scratch.set(key, value),
+      delete: (key) => void scratch.delete(key),
+    },
     llm: options.llm,
-    comments: { addBlock: (input) => addBlockComment(client, { pageId, ...input }) },
+    comments: {
+      addBlock: (input) => addBlockComment(client, { pageId, ...input }),
+      editMessage: (input) => editComment(client, { pageId, ...input }),
+    },
   }
 
   const persist = () => store.save({ cursor, kv, lastEventId })

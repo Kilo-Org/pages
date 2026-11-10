@@ -67,30 +67,63 @@ When Pages gets a real event feed, only the middle of the diagram changes: the p
 is replaced by a subscription that emits the same `page.changed` event. The program
 does not change.
 
-## Replying to settled text
+## Replying to settled text, speculatively
 
-Besides logging, `echo` watches for a block of text that stops changing and
-reads like a question or request, and replies with a block comment:
+Besides logging, `echo` watches for a block of text that reads like a
+question or request, and replies with a block comment — started *before*
+the author is necessarily done, not after a long fixed wait:
 
 ```text
 14:46:15.812 [echo:33945932] replied in thread a1b2c3d4: "Yes — ..."
+14:46:22.401 [echo:33945932] updated reply in thread a1b2c3d4: "Actually — ..."
 ```
 
-- **Trigger.** `tick(ctx)` runs on every poll (not just when an event
-  arrives — this is how the program notices that typing has *stopped*). A
-  node becomes eligible once its text has sat unchanged for `QUIET_MS`
-  (8s) and is at least a few characters long.
+- **Start early, not after a long quiet period.** `tick(ctx)` runs on every
+  poll. A node becomes eligible for a *draft* once its text has sat
+  unchanged for just `SPECULATIVE_PAUSE_MS` (1s, not the old 8s) and is at
+  least a few characters long — "worth a guess now," not "the user is
+  definitely done."
+- **Or skip the pause entirely, if the text already looks finished.**
+  `looksComplete()` checks for trailing sentence-ending punctuation
+  (`?`/`.`/`!`). Text that already looks done starts a draft immediately,
+  not after even the 1s pause — the actual "prediction": recognizing
+  that a thought already looks complete, rather than guessing at one
+  that isn't. A correction to already-complete-looking text triggers a
+  new draft the same way, immediately, not after a pause — see the next
+  point for what keeps that safe.
+- **Abort on new input.** If the text changes again before a draft
+  resolves, the in-flight model call is actually cancelled (an
+  `AbortSignal` threaded into the fetch, not just a result thrown away) and
+  nothing from it ever posts.
+- **Commit only when the revision still matches.** The real correctness
+  guarantee isn't the abort signal — it's a re-read of the node's current
+  text right before committing. A draft only ever posts/edits if the text
+  it was based on still matches current text at that instant; otherwise
+  it's silently discarded, same as an explicit abort.
 - **Decision.** One call to `ctx.llm.complete(...)` gets a strict-JSON
-  `{ respond, reply }`. If `respond` is true, `ctx.comments.addBlock(...)`
-  posts `reply` as a new comment on that block.
-- **Dedup.** Each node remembers the exact text it was last evaluated
-  against (`evaluatedText`); the same settled text is never re-evaluated.
-  The comment write itself also carries a deterministic idempotency key
-  (derived from the page, block and text), so a retried write after a
-  crash replays the original receipt instead of posting twice.
+  `{ respond, reply }`.
+- **Corrections update the existing reply, in place.** Once echo has
+  replied to a block, any further change to that block is treated as a
+  possible update to the *same* reply, not a new one — the model sees its
+  own previous reply alongside the new text and, if it decides to update,
+  writes the full replacement text, which `editMessage` applies to the
+  same comment (`manage_page_comment action:edit`). One always-current
+  answer per block, not a growing thread. This needs the editor to be the
+  message's original author, so it only works as long as `echo` keeps
+  using the same host identity across a node's lifetime (true today; worth
+  knowing if that identity ever changes mid-session).
+- **Dedup.** Each node remembers the exact text it last completed an
+  attempt for (`evaluatedText`); the same settled text is never re-asked.
+  Every comment write also carries a deterministic idempotency key, so a
+  retried write after a crash replays the original receipt instead of
+  posting or editing twice.
 - **No self-reply loop.** `echo` never edits page content, and a comment
   write never moves the Page's content `heads` — so echo's own reply can
   never show up as a new `page.changed` event for it to react to.
+- **Failures back off, they don't hot-loop.** A failed decide/write attempt
+  doesn't retry on the very next poll — backoff starts at
+  `SPECULATIVE_PAUSE_MS` and doubles (capped at 5 minutes). An aborted
+  attempt is not a failure and doesn't count toward this.
 - **Requires `KILO_API_KEY`.** Without it, `ctx.llm` is absent and `tick`
   is a no-op; `echo` still logs diffs as before.
 

@@ -9,6 +9,8 @@ const GATEWAY_URL = 'https://ai-gateway.kilo.ai/api/v1/chat/completions'
 export type KiloLlmOptions = {
   apiKey: string
   model: string
+  /** Scopes the request to a specific org's balance — some keys are shared across orgs and need this to bill correctly. */
+  orgId?: string
   fetch?: typeof fetch
 }
 
@@ -21,10 +23,14 @@ const ErrorBody = v.object({ error: v.object({ message: v.string() }) })
 export function createKiloLlm(options: KiloLlmOptions): LlmCapability {
   const doFetch = options.fetch ?? fetch
   return {
-    async complete({ system, prompt }) {
+    async complete({ system, prompt, signal }) {
       const response = await doFetch(GATEWAY_URL, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${options.apiKey}` },
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${options.apiKey}`,
+          ...(options.orgId ? { 'x-kilocode-organizationid': options.orgId } : {}),
+        },
         body: JSON.stringify({
           model: options.model,
           messages: [
@@ -33,6 +39,7 @@ export function createKiloLlm(options: KiloLlmOptions): LlmCapability {
           ],
           temperature: 0.3,
         }),
+        signal,
       })
       const text = await response.text()
       let body: unknown

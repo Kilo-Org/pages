@@ -33,9 +33,37 @@ describe('createKiloLlm', () => {
     await expect(llm.complete({ system: 's', prompt: 'p' })).rejects.toThrow('insufficient balance')
   })
 
+  test('sends the org header only when an orgId is given', async () => {
+    const { fn, calls } = fakeFetch({ body: { choices: [{ message: { content: 'ok' } }] } })
+    const llm = createKiloLlm({ apiKey: 'k', model: 'm', orgId: 'org-123', fetch: fn })
+    await llm.complete({ system: 's', prompt: 'p' })
+    const headers = calls[0]!.init?.headers as Record<string, string>
+    expect(headers['x-kilocode-organizationid']).toBe('org-123')
+
+    const { fn: fnNoOrg, calls: callsNoOrg } = fakeFetch({ body: { choices: [{ message: { content: 'ok' } }] } })
+    const llmNoOrg = createKiloLlm({ apiKey: 'k', model: 'm', fetch: fnNoOrg })
+    await llmNoOrg.complete({ system: 's', prompt: 'p' })
+    const headersNoOrg = callsNoOrg[0]!.init?.headers as Record<string, string>
+    expect(headersNoOrg['x-kilocode-organizationid']).toBeUndefined()
+  })
+
   test('rejects an empty completion', async () => {
     const { fn } = fakeFetch({ body: { choices: [{ message: { content: null } }] } })
     const llm = createKiloLlm({ apiKey: 'k', model: 'm', fetch: fn })
     await expect(llm.complete({ system: 's', prompt: 'p' })).rejects.toThrow('empty completion')
+  })
+
+  test('passes the signal through, so aborting it really cancels the request', async () => {
+    const controller = new AbortController()
+    const fn = (async (_url: string | URL | Request, init?: RequestInit) => {
+      expect(init?.signal).toBe(controller.signal)
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+      })
+    }) as typeof fetch
+    const llm = createKiloLlm({ apiKey: 'k', model: 'm', fetch: fn })
+    const promise = llm.complete({ system: 's', prompt: 'p', signal: controller.signal })
+    controller.abort()
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' })
   })
 })
