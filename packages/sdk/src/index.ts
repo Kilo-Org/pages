@@ -158,6 +158,15 @@ export type CommentsCapability = {
   }): Promise<{ threadId: string; messageId: string }>
 }
 
+/**
+ * A UX hint only: publishes a short-lived "reading" caret on a block, so a
+ * person sees the agent looking at their text before any reply is ready —
+ * not a correctness-bearing write. Safe to ignore on failure.
+ */
+export type PresenceCapability = {
+  showReading(blockId: string): Promise<void>
+}
+
 export type ProgramContext = {
   log(message: string, data?: Record<string, unknown>): void
   state: ProgramState
@@ -165,6 +174,7 @@ export type ProgramContext = {
   /** Present only when the host was given an LLM capability (e.g. KILO_API_KEY is set). */
   llm?: LlmCapability
   comments?: CommentsCapability
+  presence?: PresenceCapability
 }
 
 export type Program = {

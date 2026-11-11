@@ -403,6 +403,9 @@ const backoffFor = (failures: number) =>
  * the room lock, immediately before the write.
  */
 async function attempt(key: string, base: TargetState, ctx: ProgramContext, signal: AbortSignal): Promise<void> {
+  // Best-effort UX hint: a reading caret can show up well before the model call
+  // resolves. Never let this delay or fail the actual attempt.
+  void ctx.presence?.showReading(base.blockId).catch(() => {})
   try {
     const snapshot = await loadRoom(ctx, base.pageId)
     const verdict = triageBody(base.text, snapshot, key)

@@ -9,6 +9,7 @@ import {
   replyToComment,
   openCursor,
   pollPage,
+  showReadingPresence,
   type PageCursor,
 } from '@pages-programs/pages'
 import type { LlmCapability, Program, ProgramContext, ProgramEvent } from '@pages-programs/sdk'
@@ -84,6 +85,9 @@ export async function runProgram(options: RunOptions): Promise<void> {
       addBlock: (input) => addBlockComment(client, { pageId, ...input }),
       editMessage: (input) => editComment(client, { pageId, ...input }),
       replyToThread: (input) => replyToComment(client, { pageId, ...input }),
+    },
+    presence: {
+      showReading: (blockId) => showReadingPresence(client, { pageId, blockId }),
     },
   }
 

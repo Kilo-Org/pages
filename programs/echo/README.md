@@ -220,3 +220,22 @@ the author is necessarily done, not after a long fixed wait:
 ```sh
 KILO_API_KEY=... bun run up echo
 ```
+
+## Showing up before it has an answer
+
+The model call in `attempt()` can take a second or more. Rather than staying
+silent the whole time, `echo` publishes a "reading" caret on the block the
+moment it starts deciding, via `ctx.presence.showReading(blockId)` — a UX
+hint only, not a write that can fail the attempt. It's a best-effort call: any
+rejection is swallowed, and it is never awaited before the real `ctx.llm`
+call starts.
+
+Under the hood this is a scoped `read_page({block_ids: [blockId]})`
+(`packages/pages/src/reading-presence.ts`) — Pages already derives agent
+presence from authorized calls it sees (`model/agent-presence.mjs`), so a
+block-scoped read is enough to show a reading marker on that passage for a
+few seconds, with no dedicated presence-write endpoint needed. It only shows
+up for API-credentialed hosts (an API key or MCP OAuth) — a host signed in
+the way a browser is (the local-dev default, no `PAGES_TOKEN`) publishes
+nothing, same as a person's own editor never shows their own caret back to
+them.
