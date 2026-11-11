@@ -6,10 +6,11 @@ import type {
   LlmCapability,
   PageChange,
   PageChangedEvent,
+  PresenceCapability,
   ProgramContext,
 } from '@pages-programs/sdk'
 
-function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability }) {
+function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability; presence?: PresenceCapability }) {
   const lines: string[] = []
   const kv: Record<string, unknown> = {}
   const scratch = new Map<string, unknown>()
@@ -28,8 +29,17 @@ function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability })
     },
     llm: extra?.llm,
     comments: extra?.comments,
+    presence: extra?.presence,
   }
   return { lines, kv, scratch, ctx }
+}
+
+function fakePresence(): PresenceCapability & { shown: string[] } {
+  const shown: string[] = []
+  return {
+    shown,
+    showReading: async (blockId) => void shown.push(blockId),
+  }
 }
 
 /** Resolves (or rejects) immediately — for tests that don't care about in-flight timing. */
@@ -477,6 +487,46 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     expect(comments.edits).toEqual([])
     const saved = await ctx.state.get('nodes/b1:0')
     expect(saved).toMatchObject({ threadId: 'thread-1', messageId: 'message-1', lastReply: 'Yes, this works.', evaluatedText: 'Does it work?' })
+  })
+
+  test('shows a reading caret on the block before the model call resolves, not after', async () => {
+    const comments = fakeComments()
+    const presence = fakePresence()
+    const deferred = deferredLlm()
+    const { ctx } = harness({ llm: deferred.llm, comments, presence })
+    const base = record({ text: 'Does it work?' })
+    await ctx.state.set('nodes/b1:0', base)
+    const pending = attempt('nodes/b1:0', base, ctx, new AbortController().signal)
+    await flush()
+    // The reading caret shows up while the model call is still in flight, not
+    // only once a reply is ready to post.
+    expect(presence.shown).toEqual(['b1'])
+    expect(comments.posts).toEqual([])
+    deferred.resolve({ respond: true, reply: 'Yes, this works.' })
+    await pending
+    expect(comments.posts).toHaveLength(1)
+  })
+
+  test('a failing presence hint never blocks or breaks the actual reply', async () => {
+    const comments = fakeComments()
+    const llm = fakeLlm(() => ({ respond: true, reply: 'Yes, this works.' }))
+    const presence: PresenceCapability = { showReading: async () => { throw new Error('read_page unavailable') } }
+    const { ctx } = harness({ llm, comments, presence })
+    const base = record({ text: 'Does it work?' })
+    await ctx.state.set('nodes/b1:0', base)
+    await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
+    await flush()
+    expect(comments.posts).toEqual([{ blockId: 'b1', body: 'Yes, this works.', dedupeOn: 'Does it work?' }])
+  })
+
+  test('no presence capability configured: attempt still proceeds normally', async () => {
+    const comments = fakeComments()
+    const llm = fakeLlm(() => ({ respond: true, reply: 'Yes, this works.' }))
+    const { ctx } = harness({ llm, comments })
+    const base = record({ text: 'Does it work?' })
+    await ctx.state.set('nodes/b1:0', base)
+    await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
+    expect(comments.posts).toEqual([{ blockId: 'b1', body: 'Yes, this works.', dedupeOn: 'Does it work?' }])
   })
 
   test('a correction after a reply edits the same thread/message, not a new one', async () => {

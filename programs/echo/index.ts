@@ -163,6 +163,9 @@ const backoffFor = (failures: number) =>
 async function attempt(key: string, base: NodeRecord, ctx: ProgramContext, signal: AbortSignal): Promise<void> {
   const system = base.threadId ? FOLLOWUP_SYSTEM_PROMPT : SYSTEM_PROMPT
   const prompt = base.threadId ? `Previous reply: ${JSON.stringify(base.lastReply)}\n\nCurrent text: ${base.text}` : base.text
+  // Best-effort UX hint: a reading caret can show up well before the model call
+  // resolves. Never let this delay or fail the actual attempt.
+  void ctx.presence?.showReading(base.blockId).catch(() => {})
   try {
     const raw = await ctx.llm!.complete({ system, prompt, signal })
     const decision = parseDecision(raw)
