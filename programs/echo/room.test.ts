@@ -1,24 +1,29 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  activateStep,
   admitIntent,
   applyTriage,
   bumpIntentVersion,
+  cancelPlan,
   cancelStaleSteps,
   clearSelection,
   commitIsCurrent,
+  completePlan,
+  completeStep,
   emptyRoom,
-  ensureStep,
+  failStep,
   findActiveIntentForTarget,
-  findCurrentStep,
-  markStepActive,
-  markStepDone,
   migrateNodes,
+  nextStep,
   noteSelection,
   noteUserChange,
+  planIntent,
   recordBodyChange,
   recordCommentEvidence,
   recordTarget,
   removeTarget,
+  stepsForVersion,
+  validatePlanSteps,
   type PlanStep,
   type RoomState,
   type TargetState,
@@ -31,6 +36,7 @@ const target = (overrides: Partial<TargetState> = {}): TargetState => ({
   pageId: 'p',
   blockId: 'b1',
   text: 'Hello',
+  previousText: null,
   changedAt: 1,
   evaluatedText: null,
   failures: 0,
@@ -48,7 +54,9 @@ const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
   intentId: 'intent',
   intentVersion: 1,
   status: 'pending',
+  kind: 'draft_reply',
   description: 'answer',
+  position: 0,
   owner: null,
   dependsOn: [],
   assumedRevision: null,
@@ -318,65 +326,127 @@ describe('comments and selections as evidence', () => {
 describe('plan steps', () => {
   const scope = { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' }
 
-  test('applyTriage admits an intent and its one current-version step, pending', () => {
-    const room = applyTriage(
+  test('applyTriage admits an intent without inventing a plan', () => {
+    const applied = applyTriage(
       emptyRoom('p'),
       { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
       at,
       false,
     )
-    const intentId = Object.keys(room.intents)[0]!
-    expect(room.steps[`${intentId}:1`]).toMatchObject({
-      intentId,
-      intentVersion: 1,
-      status: 'pending',
-      description: 'produce a reply addressing the request',
-    })
+    expect(applied.intent?.kind).toBe('action')
+    expect(applied.room.steps).toEqual({})
   })
 
-  test('applyTriage with bump: true cancels the prior stale step and admits a fresh one', () => {
+  test('applyTriage with bump: true cancels the prior stale step without creating a new one', () => {
     const admitted = applyTriage(
       emptyRoom('p'),
       { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
       at,
       false,
     )
-    const intentId = Object.keys(admitted.intents)[0]!
+    const intentId = admitted.intent!.id
+    const planned = planIntent(admitted.room, intentId, 1, [
+      { key: 'draft', kind: 'draft_reply', description: 'Draft' },
+    ])
+    const active = activateStep(planned, stepsForVersion(planned, intentId, 1)[0]!.id)
     const bumped = applyTriage(
-      admitted,
+      active,
       { intentId, kind: 'correction', targetScope: scope, confidence: 0.8, evidence: { eventId: 'e2', at } },
       at,
       true,
     )
-    expect(bumped.intents[intentId]?.version).toBe(2)
-    expect(bumped.steps[`${intentId}:1`]?.status).toBe('cancelled')
-    expect(bumped.steps[`${intentId}:2`]).toMatchObject({
-      status: 'pending',
-      description: 'revise the reply for the corrected request',
-    })
+    expect(bumped.room.intents[intentId]?.version).toBe(2)
+    expect(stepsForVersion(bumped.room, intentId, 1)[0]?.status).toBe('cancelled')
+    expect(stepsForVersion(bumped.room, intentId, 2)).toEqual([])
   })
 
-  test('ensureStep relabels the current step in place instead of resetting its status', () => {
+  test('planIntent creates ordered steps with dependencies and nextStep picks the first', () => {
     const admitted = applyTriage(
       emptyRoom('p'),
       { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
       at,
       false,
     )
-    const intentId = Object.keys(admitted.intents)[0]!
-    const active = markStepActive(admitted, intentId)
-    const relabeled = ensureStep(active, intentId, 'answer the question')
-    expect(relabeled.steps[`${intentId}:1`]).toMatchObject({
-      status: 'active',
-      description: 'answer the question',
-    })
+    const intentId = admitted.intent!.id
+    const room = planIntent(admitted.room, intentId, 1, [
+      { key: 'draft', kind: 'draft_reply', description: 'Draft' },
+      { key: 'post', kind: 'post_reply', description: 'Post', dependsOn: ['draft'] },
+    ])
+    const steps = stepsForVersion(room, intentId, 1)
+    expect(steps.map((s) => s.id)).toEqual([`${intentId}:1:draft`, `${intentId}:1:post`])
+    expect(steps[1]?.dependsOn).toEqual([`${intentId}:1:draft`])
+    expect(nextStep(room, intentId)?.id).toBe(`${intentId}:1:draft`)
+
+    const first = activateStep(room, `${intentId}:1:draft`)
+    expect(nextStep(first, intentId)?.id).toBe(`${intentId}:1:draft`)
+    const done = completeStep(first, `${intentId}:1:draft`)
+    expect(nextStep(done, intentId)?.id).toBe(`${intentId}:1:post`)
   })
 
-  test('markStepActive/markStepDone are no-ops without a current step', () => {
-    const room = emptyRoom('p')
-    expect(markStepActive(room, 'missing')).toBe(room)
-    expect(markStepDone(room, 'missing')).toBe(room)
-    expect(findCurrentStep(room, 'missing')).toBeUndefined()
+  test('plan validation rejects duplicates, missing dependencies, cycles, and oversized plans', () => {
+    expect(
+      validatePlanSteps([
+        { key: 'a', kind: 'draft_reply', description: 'A' },
+        { key: 'a', kind: 'post_reply', description: 'B' },
+      ]),
+    ).toContain('duplicate')
+    expect(
+      validatePlanSteps([{ key: 'a', kind: 'draft_reply', description: 'A', dependsOn: ['x'] }]),
+    ).toContain('missing')
+    expect(
+      validatePlanSteps([
+        { key: 'a', kind: 'draft_reply', description: 'A', dependsOn: ['b'] },
+        { key: 'b', kind: 'post_reply', description: 'B', dependsOn: ['a'] },
+      ]),
+    ).toContain('cycle')
+    expect(
+      validatePlanSteps(
+        Array.from({ length: 6 }, (_, i) => ({
+          key: `s${i}`,
+          kind: 'draft_reply' as const,
+          description: 'x',
+        })),
+      ),
+    ).toContain('five')
+  })
+
+  test('planIntent rejects a stale version and does not overwrite executed work', () => {
+    const admitted = applyTriage(
+      emptyRoom('p'),
+      { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
+      at,
+      false,
+    )
+    const intentId = admitted.intent!.id
+    expect(planIntent(admitted.room, intentId, 2, [{ key: 'x', kind: 'draft_reply', description: 'x' }])).toBe(
+      admitted.room,
+    )
+    const planned = planIntent(admitted.room, intentId, 1, [
+      { key: 'draft', kind: 'draft_reply', description: 'Draft' },
+    ])
+    const done = completeStep(planned, `${intentId}:1:draft`)
+    expect(
+      planIntent(done, intentId, 1, [{ key: 'other', kind: 'post_reply', description: 'Other' }]),
+    ).toBe(done)
+  })
+
+  test('a stale step cannot be completed, failed work retries, and cancelPlan settles it', () => {
+    const admitted = applyTriage(
+      emptyRoom('p'),
+      { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
+      at,
+      false,
+    )
+    const intentId = admitted.intent!.id
+    const planned = planIntent(admitted.room, intentId, 1, [
+      { key: 'draft', kind: 'draft_reply', description: 'Draft' },
+    ])
+    const active = activateStep(planned, `${intentId}:1:draft`)
+    expect(failStep(active, `${intentId}:1:draft`).steps[`${intentId}:1:draft`]?.status).toBe('pending')
+    expect(completePlan(active, intentId).steps[`${intentId}:1:draft`]?.status).toBe('done')
+    expect(cancelPlan(active, intentId).steps[`${intentId}:1:draft`]?.status).toBe('cancelled')
+    const bumped = bumpIntentVersion(active, intentId, { eventId: 'e2', at }, at)
+    expect(completeStep(bumped, `${intentId}:1:draft`)).toBe(bumped)
   })
 })
 

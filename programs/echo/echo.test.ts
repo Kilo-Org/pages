@@ -516,6 +516,7 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
       pageId: 'p',
       blockId: 'b1',
       text: 'placeholder',
+      previousText: null,
       changedAt: Date.now(),
       evaluatedText: null,
       failures: 0,
@@ -702,6 +703,40 @@ describe('triage wiring', () => {
     ])
   })
 
+  test('a correction with no earlier reply asks what to change instead of staying silent', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'What should I change?' }))
+    const comments = fakeComments()
+    const { ctx, lines } = harness({ llm: spy.llm, comments })
+    await echo.handle(event(1, [node('updated', 'no.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(spy.calls).toHaveLength(1)
+    expect(spy.calls[0]?.system).toContain('correction')
+    expect(comments.posts).toEqual([
+      { blockId: 'b1', body: 'What should I change?', dedupeOn: 'no.' },
+    ])
+    expect(lines.some((line) => line.includes('triage b1: correction'))).toBe(true)
+  })
+
+  test('a correction includes the text it replaced', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'Shorter.' }))
+    const comments = fakeComments()
+    const { ctx } = harness({ llm: spy.llm, comments })
+    await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
+    await echo.handle(event(2, [node('updated', 'Actually, make it shorter.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(spy.calls[0]?.prompt).toContain(
+      'Previous text: "Please tighten this paragraph."',
+    )
+    expect(spy.calls[0]?.prompt).toContain('Current text: "Actually, make it shorter."')
+    expect(comments.posts).toEqual([
+      { blockId: 'b1', body: 'Shorter.', dedupeOn: 'Actually, make it shorter.' },
+    ])
+  })
+
   test('a person comment gets a threaded reply, and redelivery does not duplicate it', async () => {
     const spy = scriptedLlm(() => ({ respond: true, reply: 'Yes, that is the idea.' }))
     const comments = fakeComments()
@@ -709,6 +744,7 @@ describe('triage wiring', () => {
     const change = commentChange()
 
     await echo.handle(event(1, [change]), ctx)
+    expect(spy.calls[0]?.system).toContain('do not stay silent')
     expect(comments.replies).toEqual([
       {
         threadId: 't1',
@@ -720,6 +756,26 @@ describe('triage wiring', () => {
     expect(intent.targetScope.threadId).toBe('t1')
 
     await echo.handle(event(1, [change]), ctx)
+    expect(comments.replies).toHaveLength(1)
+  })
+
+  test('a comment generation failure leaves no intent behind and retries at version 1', async () => {
+    let fail = true
+    const spy = scriptedLlm(() => {
+      if (fail) throw new Error('gateway down')
+      return { respond: true, reply: 'Yes.' }
+    })
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm: spy.llm, comments })
+    const change = commentChange()
+
+    await expect(echo.handle(event(1, [change]), ctx)).rejects.toThrow('gateway down')
+    expect(Object.keys((kv.room as RoomState | undefined)?.intents ?? {})).toEqual([])
+
+    fail = false
+    await echo.handle(event(2, [change]), ctx)
+    const intent = Object.values((kv.room as RoomState).intents)[0]!
+    expect(intent.version).toBe(1)
     expect(comments.replies).toHaveLength(1)
   })
 
@@ -775,7 +831,7 @@ describe('triage wiring', () => {
 })
 
 describe('plan steps — the to-do list behind an intent', () => {
-  test('a body action creates a step, active while the model drafts, done once the reply posts', async () => {
+  test('a body action creates an ordered plan, active while drafting and done after posting', async () => {
     const d = deferredLlm()
     const { kv, ctx } = harness({ llm: d.llm, comments: fakeComments() })
     await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
@@ -783,27 +839,33 @@ describe('plan steps — the to-do list behind an intent', () => {
     await flush()
 
     const intentId = Object.keys((kv.room as RoomState).intents)[0]!
-    const stepId = `${intentId}:1`
-    expect((kv.room as RoomState).steps[stepId]).toMatchObject({
+    expect((kv.room as RoomState).steps[`${intentId}:1:draft`]).toMatchObject({
       intentId,
       intentVersion: 1,
       status: 'active',
-      description: 'produce a reply addressing the request',
+      kind: 'draft_reply',
+      description: 'Draft the reply',
+    })
+    expect((kv.room as RoomState).steps[`${intentId}:1:post`]).toMatchObject({
+      status: 'pending',
+      kind: 'post_reply',
+      dependsOn: [`${intentId}:1:draft`],
     })
 
     d.resolve({ respond: true, reply: 'Done.' })
     await flush()
-    expect((kv.room as RoomState).steps[stepId]?.status).toBe('done')
+    expect((kv.room as RoomState).steps[`${intentId}:1:draft`]?.status).toBe('done')
+    expect((kv.room as RoomState).steps[`${intentId}:1:post`]?.status).toBe('done')
   })
 
-  test('a correction bumps the version: the old step goes stale then cancelled, a fresh one is pending', async () => {
+  test('a correction bumps the version and replaces the plan', async () => {
     const spy = scriptedLlm(() => ({ respond: true, reply: 'Shorter.' }))
     const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
     await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
     await echo.tick!(ctx)
     await flush()
     const intentId = Object.keys((kv.room as RoomState).intents)[0]!
-    expect((kv.room as RoomState).steps[`${intentId}:1`]?.status).toBe('done')
+    expect((kv.room as RoomState).steps[`${intentId}:1:draft`]?.status).toBe('done')
 
     await echo.handle(event(2, [node('updated', 'Actually make it shorter.')]), ctx)
     await echo.tick!(ctx)
@@ -811,8 +873,17 @@ describe('plan steps — the to-do list behind an intent', () => {
 
     const room = kv.room as RoomState
     expect(room.intents[intentId]?.version).toBe(2)
-    expect(room.steps[`${intentId}:1`]?.status).toBe('cancelled')
-    expect(room.steps[`${intentId}:2`]).toMatchObject({ status: 'done', intentVersion: 2 })
+    expect(room.steps[`${intentId}:1:draft`]?.status).toBe('cancelled')
+    expect(room.steps[`${intentId}:2:draft`]).toMatchObject({
+      status: 'done',
+      intentVersion: 2,
+      kind: 'draft_reply',
+    })
+    expect(room.steps[`${intentId}:2:edit`]).toMatchObject({
+      status: 'done',
+      intentVersion: 2,
+      kind: 'edit_reply',
+    })
   })
 
   test('an ignored body change never gets a plan step', async () => {
@@ -823,24 +894,94 @@ describe('plan steps — the to-do list behind an intent', () => {
     expect((kv.room as RoomState).steps).toEqual({})
   })
 
-  test('a comment thread marks its step done, whether or not echo actually replies', async () => {
+  test('a chat comment gets no plan, whether or not echo replies', async () => {
     const spy = scriptedLlm(() => ({ respond: true, reply: 'Yes.' }))
     const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
     await echo.handle(event(1, [commentChange()]), ctx)
-
-    const intentId = Object.keys((kv.room as RoomState).intents)[0]!
-    expect((kv.room as RoomState).steps[`${intentId}:1`]).toMatchObject({
-      status: 'done',
-      description: 'answer the question',
-    })
+    expect((kv.room as RoomState).steps).toEqual({})
   })
 
-  test('a comment echo declines to answer still settles its step as done, not stuck active', async () => {
+  test('a declined action comment cancels its plan', async () => {
     const spy = scriptedLlm(() => ({ respond: false }))
     const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
-    await echo.handle(event(1, [commentChange({ body: 'Should I keep this?' })]), ctx)
+    await echo.handle(event(1, [commentChange({ body: 'Please add a summary.' })]), ctx)
 
-    const intentId = Object.keys((kv.room as RoomState).intents)[0]!
-    expect((kv.room as RoomState).steps[`${intentId}:1`]?.status).toBe('done')
+    const room = kv.room as RoomState
+    const intentId = Object.keys(room.intents)[0]!
+    expect(room.intents[intentId]?.kind).toBe('action')
+    const steps = Object.values(room.steps).filter((step) => step.intentId === intentId)
+    expect(steps).toHaveLength(2)
+    expect(steps.every((step) => step.status === 'cancelled')).toBe(true)
+  })
+
+  test('todo_write proposes the plan when the host supports tools', async () => {
+    const calls: { system: string; prompt: string }[] = []
+    const llm: LlmCapability = {
+      complete: async ({ system, prompt }) => {
+        calls.push({ system, prompt })
+        return JSON.stringify({ respond: true, reply: 'Done.' })
+      },
+      completeWithTools: async ({ system, prompt }) => {
+        calls.push({ system, prompt })
+        return {
+          content: null,
+          toolCalls: [
+            {
+              id: 'call_1',
+              name: 'todo_write',
+              arguments: {
+                steps: [
+                  { key: 'draft', kind: 'draft_reply', description: 'Draft the tightened paragraph' },
+                  {
+                    key: 'post',
+                    kind: 'post_reply',
+                    description: 'Post the tightened paragraph',
+                    dependsOn: ['draft'],
+                  },
+                ],
+              },
+            },
+          ],
+        }
+      },
+    }
+    const { kv, ctx } = harness({ llm, comments: fakeComments() })
+    await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const room = kv.room as RoomState
+    const intentId = Object.keys(room.intents)[0]!
+    expect(room.steps[`${intentId}:1:draft`]?.description).toBe('Draft the tightened paragraph')
+    expect(room.steps[`${intentId}:1:post`]?.description).toBe('Post the tightened paragraph')
+    expect(calls.some((call) => call.system.includes('You plan the work'))).toBe(true)
+  })
+
+  test('a plan the executor cannot run falls back to the executable plan', async () => {
+    const llm: LlmCapability = {
+      complete: async () => JSON.stringify({ respond: true, reply: 'Done.' }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: [{ key: 'edit', kind: 'edit_reply', description: 'Edit a reply that does not exist' }],
+            },
+          },
+        ],
+      }),
+    }
+    const { kv, ctx, lines } = harness({ llm, comments: fakeComments() })
+    await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const room = kv.room as RoomState
+    const intentId = Object.keys(room.intents)[0]!
+    expect(room.steps[`${intentId}:1:draft`]).toMatchObject({ kind: 'draft_reply', status: 'done' })
+    expect(room.steps[`${intentId}:1:post`]).toMatchObject({ kind: 'post_reply', status: 'done' })
+    expect(lines.some((line) => line.includes('no executable plan'))).toBe(true)
   })
 })

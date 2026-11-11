@@ -105,6 +105,35 @@ export type ScratchState = {
 export type LlmCapability = {
   /** `signal`, if given, aborts the underlying request — for discarding stale speculative work. */
   complete(input: { system: string; prompt: string; signal?: AbortSignal }): Promise<string>
+  /**
+   * Optional tool-calling path. Hosts that do not implement it leave `undefined`; programs
+   * must fall back to a deterministic plan instead of failing.
+   */
+  completeWithTools?(input: {
+    system: string
+    prompt: string
+    tools: LlmTool[]
+    toolChoice?: 'auto' | 'required'
+    signal?: AbortSignal
+  }): Promise<LlmToolResponse>
+}
+
+/** A tool the model may call, in the OpenAI function-calling shape (without the wrapper). */
+export type LlmTool = {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+}
+
+export type LlmToolCall = {
+  id: string
+  name: string
+  arguments: unknown
+}
+
+export type LlmToolResponse = {
+  content: string | null
+  toolCalls: LlmToolCall[]
 }
 
 /** Comment writes. The host supplies the Pages client and credentials. */

@@ -95,7 +95,9 @@ ledger plus the bookkeeping the executor needs.
 
 - `intents` — one per target, with `kind`, `status`, `version`,
   `targetScope`, `outputKind`, `confidence`, and evidence.
-- `steps` — planned work for an intent. A version bump marks older steps
+- `steps` — ordered work for one intent version: 1–5 steps with `kind`,
+  `position`, and `dependsOn`. `new_action` and `correction` get a plan;
+  `chat`, `clarify`, and `ignore` do not. A version bump marks older steps
   `stale`; they are cancelled only when unowned.
 - `targets` — per-node reply identity (`threadId`/`messageId`/`lastReply`),
   dedupe text, backoff, and the `generation` / `assumedIntentVersion` fence.
@@ -127,9 +129,32 @@ answer:
 output. A clear correction never calls the classification model; it goes
 straight to the answer generation call.
 
+Rules read a lightly normalized copy of the text, with markdown emphasis,
+code ticks, and leading escapes removed, so `**Does this work?**` is still
+recognized as a question. A body correction prompt also carries the text the
+edit replaced (`previousText`), so "make it shorter" has something to
+shorten. If there is no previous text to work from, the model asks for it.
+
+Generation follows triage instead of deciding again. `new_action` and `chat`
+must answer or ask one short clarifying question, and a `correction` with no
+earlier reply must act on the previous text or ask what to change. If the
+model declines one of those outcomes anyway, echo logs `declined …: triage
+<outcome>` instead of treating silence as a successful evaluation.
+
+For `new_action` and `correction`, echo asks the model for an ordered plan
+through the `todo_write` tool, then the room validates and persists it.
+Steps are limited to executable kinds (`draft_reply`, `post_reply`,
+`edit_reply`); a plan that names unsupported work, repeats keys, has a cycle,
+or uses `edit_reply` without an existing reply is rejected. Hosts without
+`completeWithTools` fall back to `draft → post` (or `draft → edit` for a
+body correction). Chat never gets a plan, so a knowledge answer cannot become
+a hidden to-do item.
+
 A comment on an active thread is answered in that thread with
 `replyToThread`, not by creating a new block comment. The handled message
 body is recorded per thread, so a redelivered event cannot double-reply.
+A failed comment generation creates no intent and bumps no version; the
+retry starts clean and only records the intent when the reply succeeds.
 
 ## Replying to settled text, speculatively
 

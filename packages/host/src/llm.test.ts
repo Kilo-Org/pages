@@ -53,6 +53,76 @@ describe('createKiloLlm', () => {
     await expect(llm.complete({ system: 's', prompt: 'p' })).rejects.toThrow('empty completion')
   })
 
+  test('parses tool calls and allows null content', async () => {
+    const { fn, calls } = fakeFetch({
+      body: {
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  id: 'call_1',
+                  type: 'function',
+                  function: {
+                    name: 'todo_write',
+                    arguments: JSON.stringify({ steps: [{ key: 'draft', kind: 'draft_reply' }] }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    })
+    const llm = createKiloLlm({ apiKey: 'k', model: 'm', fetch: fn })
+    const result = await llm.completeWithTools!({
+      system: 's',
+      prompt: 'p',
+      tools: [{ name: 'todo_write', description: 'plan', parameters: { type: 'object' } }],
+      toolChoice: 'required',
+    })
+    expect(result.content).toBeNull()
+    expect(result.toolCalls).toEqual([
+      {
+        id: 'call_1',
+        name: 'todo_write',
+        arguments: { steps: [{ key: 'draft', kind: 'draft_reply' }] },
+      },
+    ])
+    const body = JSON.parse(String(calls[0]!.init?.body))
+    expect(body.tools).toEqual([
+      {
+        type: 'function',
+        function: { name: 'todo_write', description: 'plan', parameters: { type: 'object' } },
+      },
+    ])
+    expect(body.tool_choice).toBe('required')
+  })
+
+  test('rejects malformed tool arguments', async () => {
+    const { fn } = fakeFetch({
+      body: {
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [{ id: 'call_1', function: { name: 'todo_write', arguments: '{' } }],
+            },
+          },
+        ],
+      },
+    })
+    const llm = createKiloLlm({ apiKey: 'k', model: 'm', fetch: fn })
+    await expect(
+      llm.completeWithTools!({
+        system: 's',
+        prompt: 'p',
+        tools: [{ name: 'todo_write', description: 'plan', parameters: {} }],
+      }),
+    ).rejects.toThrow('malformed tool arguments')
+  })
+
   test('passes the signal through, so aborting it really cancels the request', async () => {
     const controller = new AbortController()
     const fn = (async (_url: string | URL | Request, init?: RequestInit) => {

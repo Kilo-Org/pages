@@ -37,12 +37,27 @@ export type Intent = {
 
 export type StepStatus = 'pending' | 'active' | 'done' | 'stale' | 'cancelled'
 
+/** Steps the executor can actually perform. A free-text plan is not executable. */
+export type StepKind = 'draft_reply' | 'post_reply' | 'edit_reply'
+
+export const STEP_KINDS: readonly StepKind[] = ['draft_reply', 'post_reply', 'edit_reply']
+
+export type PlanStepInput = {
+  key: string
+  kind: StepKind
+  description: string
+  dependsOn?: string[]
+}
+
 export type PlanStep = {
   id: string
   intentId: string
   intentVersion: number
   status: StepStatus
+  kind: StepKind | null
   description: string
+  /** Ordering within a version; lower runs first. */
+  position: number
   owner: string | null
   dependsOn: string[]
   assumedRevision: string | null
@@ -55,6 +70,8 @@ export type TargetState = {
   pageId: string
   blockId: string
   text: string
+  /** The node text this change replaced, for correction prompts. */
+  previousText: string | null
   changedAt: number
   evaluatedText: string | null
   failures: number
@@ -103,19 +120,49 @@ export const emptyRoom = (pageId = ''): RoomState => ({
 const scopeKey = (scope: TargetScope) =>
   scope.threadId ?? scope.nodeKey ?? scope.blockId ?? 'page'
 
-const stepId = (intentId: string, version: number) => `${intentId}:${version}`
+const stepId = (intentId: string, version: number, key: string) =>
+  `${intentId}:${version}:${key}`
 
-const describeStep = (kind: IntentKind): string => {
-  switch (kind) {
-    case 'action':
-      return 'produce a reply addressing the request'
-    case 'correction':
-      return 'revise the reply for the corrected request'
-    case 'chat':
-      return 'answer the question'
-    case 'clarify':
-      return 'ask a clarifying question'
+const PLAN_KEY = /^[A-Za-z0-9_-]{1,40}$/
+
+/** Returns a human-readable problem, or null when the proposed plan is usable. */
+export function validatePlanSteps(steps: PlanStepInput[]): string | null {
+  if (steps.length < 1) return 'plan needs at least one step'
+  if (steps.length > 5) return 'plan supports at most five steps'
+  const keys = new Set<string>()
+  for (const step of steps) {
+    if (!PLAN_KEY.test(step.key)) return `invalid step key ${JSON.stringify(step.key)}`
+    if (keys.has(step.key)) return `duplicate step key ${step.key}`
+    keys.add(step.key)
+    if (!STEP_KINDS.includes(step.kind)) return `invalid step kind ${String(step.kind)}`
+    if (!step.description.trim()) return `step ${step.key} needs a description`
+    if (step.description.length > 200) return `step ${step.key} description is too long`
   }
+  for (const step of steps) {
+    for (const dependency of step.dependsOn ?? []) {
+      if (dependency === step.key) return `step ${step.key} cannot depend on itself`
+      if (!keys.has(dependency)) return `step ${step.key} depends on missing ${dependency}`
+    }
+  }
+  const state = new Map<string, 'visiting' | 'done'>()
+  const visit = (key: string, path: string[]): string | null => {
+    const current = state.get(key)
+    if (current === 'done') return null
+    if (current === 'visiting') return `plan has a cycle: ${[...path, key].join(' -> ')}`
+    state.set(key, 'visiting')
+    const step = steps.find((candidate) => candidate.key === key)!
+    for (const dependency of step.dependsOn ?? []) {
+      const problem = visit(dependency, [...path, key])
+      if (problem) return problem
+    }
+    state.set(key, 'done')
+    return null
+  }
+  for (const step of steps) {
+    const problem = visit(step.key, [])
+    if (problem) return problem
+  }
+  return null
 }
 
 const copyTargets = (room: RoomState, targets: Record<string, TargetState>): RoomState => ({
@@ -184,9 +231,12 @@ export function markCommentHandled(
   }
 }
 
+export type TriageApplication = { room: RoomState; intent?: Intent }
+
 /**
  * Applies a triage decision to the room. Body changes already bumped their
  * intent in recordBodyChange; comment changes pass `bump: true`.
+ * Planning is a separate transition: chat and clarify deliberately get no steps.
  */
 export function applyTriage(
   room: RoomState,
@@ -199,8 +249,8 @@ export function applyTriage(
   },
   now: string,
   bump: boolean,
-): RoomState {
-  if (input.kind === null) return room
+): TriageApplication {
+  if (input.kind === null) return { room }
   const intent =
     (input.intentId && room.intents[input.intentId]) ||
     (input.targetScope.threadId && findIntentForThread(room, input.targetScope.threadId)) ||
@@ -219,7 +269,7 @@ export function applyTriage(
       },
       now,
     )
-    return ensureStep(admitted.room, admitted.intent.id, describeStep(input.kind))
+    return { room: admitted.room, intent: admitted.intent }
   }
   const based = bump
     ? cancelStaleSteps(bumpIntentVersion(room, intent.id, input.evidence, now), intent.id)
@@ -240,7 +290,7 @@ export function applyTriage(
       updatedAt: now,
     },
   })
-  return ensureStep(updated, intent.id, describeStep(input.kind))
+  return { room: updated, intent: updated.intents[intent.id] }
 }
 
 export function admitIntent(
@@ -321,52 +371,112 @@ export function cancelStaleSteps(room: RoomState, intentId: string): RoomState {
   return changed ? { ...room, steps } : room
 }
 
-/** The one plan step for an intent's current version — the unit of work the executor owes it. */
-export function findCurrentStep(room: RoomState, intentId: string): PlanStep | undefined {
+/** Steps for one intent version, in execution order. */
+export function stepsForVersion(
+  room: RoomState,
+  intentId: string,
+  version: number,
+): PlanStep[] {
+  return Object.values(room.steps)
+    .filter((step) => step.intentId === intentId && step.intentVersion === version)
+    .sort((a, b) => a.position - b.position)
+}
+
+/** The executor's next unit of work: an active step, or the first pending step whose dependencies are done. */
+export function nextStep(room: RoomState, intentId: string): PlanStep | undefined {
   const intent = room.intents[intentId]
-  return intent ? room.steps[stepId(intentId, intent.version)] : undefined
+  if (!intent) return undefined
+  const steps = stepsForVersion(room, intentId, intent.version)
+  const active = steps.find((step) => step.status === 'active')
+  if (active) return active
+  return steps.find(
+    (step) =>
+      step.status === 'pending' &&
+      step.dependsOn.every((dependency) => room.steps[dependency]?.status === 'done'),
+  )
 }
 
 /**
- * Creates the current version's step if it doesn't exist yet, or refreshes its
- * description if triage relabeled the intent's kind without bumping the version.
- * Leaves status/owner alone either way.
+ * Creates the ordered plan for one intent version. A version that already has
+ * executed work is left alone, so a retry cannot overwrite progress.
  */
-export function ensureStep(room: RoomState, intentId: string, description: string): RoomState {
+export function planIntent(
+  room: RoomState,
+  intentId: string,
+  version: number,
+  steps: PlanStepInput[],
+): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent || intent.version !== version) return room
+  if (validatePlanSteps(steps)) return room
+  const existing = stepsForVersion(room, intentId, version)
+  if (existing.some((step) => step.status === 'active' || step.status === 'done')) return room
+  const ids = new Map(steps.map((step) => [step.key, stepId(intentId, version, step.key)]))
+  const planned: PlanStep[] = steps.map((step, position) => ({
+    id: ids.get(step.key)!,
+    intentId,
+    intentVersion: version,
+    status: 'pending',
+    kind: step.kind,
+    description: step.description,
+    position,
+    owner: null,
+    dependsOn: (step.dependsOn ?? []).map((key) => ids.get(key)!),
+    assumedRevision: null,
+  }))
+  const kept = Object.fromEntries(
+    Object.entries(room.steps).filter(
+      ([, step]) => !(step.intentId === intentId && step.intentVersion === version),
+    ),
+  )
+  const created = Object.fromEntries(planned.map((step) => [step.id, step]))
+  return { ...room, steps: { ...kept, ...created } }
+}
+
+export function activateStep(room: RoomState, id: string): RoomState {
+  const step = room.steps[id]
+  if (!step || step.status !== 'pending') return room
+  const intent = room.intents[step.intentId]
+  if (!intent || intent.version !== step.intentVersion) return room
+  return { ...room, steps: { ...room.steps, [id]: { ...step, status: 'active' } } }
+}
+
+export function completeStep(room: RoomState, id: string): RoomState {
+  const step = room.steps[id]
+  if (!step || (step.status !== 'pending' && step.status !== 'active')) return room
+  const intent = room.intents[step.intentId]
+  if (!intent || intent.version !== step.intentVersion) return room
+  return { ...room, steps: { ...room.steps, [id]: { ...step, status: 'done' } } }
+}
+
+/** A failed step becomes pending again so the next attempt can retry it. */
+export function failStep(room: RoomState, id: string): RoomState {
+  const step = room.steps[id]
+  if (!step || (step.status !== 'pending' && step.status !== 'active')) return room
+  return { ...room, steps: { ...room.steps, [id]: { ...step, status: 'pending' } } }
+}
+
+/** The whole current plan finished in one executor pass. */
+export function completePlan(room: RoomState, intentId: string): RoomState {
   const intent = room.intents[intentId]
   if (!intent) return room
-  const id = stepId(intentId, intent.version)
-  const existing = room.steps[id]
-  if (existing && existing.description === description) return room
-  const step: PlanStep = existing
-    ? { ...existing, description }
-    : {
-        id,
-        intentId,
-        intentVersion: intent.version,
-        status: 'pending',
-        description,
-        owner: null,
-        dependsOn: [],
-        assumedRevision: null,
-      }
-  return { ...room, steps: { ...room.steps, [id]: step } }
+  let next = room
+  for (const step of stepsForVersion(room, intentId, intent.version)) {
+    if (step.status === 'pending' || step.status === 'active') next = completeStep(next, step.id)
+  }
+  return next
 }
 
-export function setStepStatus(room: RoomState, id: string, status: StepStatus): RoomState {
-  const step = room.steps[id]
-  if (!step || step.status === status) return room
-  return { ...room, steps: { ...room.steps, [id]: { ...step, status } } }
-}
-
-export function markStepActive(room: RoomState, intentId: string): RoomState {
-  const step = findCurrentStep(room, intentId)
-  return step ? setStepStatus(room, step.id, 'active') : room
-}
-
-export function markStepDone(room: RoomState, intentId: string): RoomState {
-  const step = findCurrentStep(room, intentId)
-  return step ? setStepStatus(room, step.id, 'done') : room
+export function cancelPlan(room: RoomState, intentId: string): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent) return room
+  let next = room
+  for (const step of stepsForVersion(room, intentId, intent.version)) {
+    if (step.status === 'pending' || step.status === 'active') {
+      next = { ...next, steps: { ...next.steps, [step.id]: { ...step, status: 'cancelled' } } }
+    }
+  }
+  return next
 }
 
 export function noteUserChange(
@@ -551,6 +661,8 @@ export function migrateNodes(
       pageId,
       blockId,
       text: record.text,
+      previousText:
+        typeof record.previousText === 'string' ? record.previousText : null,
       changedAt: typeof record.changedAt === 'number' ? record.changedAt : 0,
       evaluatedText:
         typeof record.evaluatedText === 'string' ? record.evaluatedText : null,

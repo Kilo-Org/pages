@@ -2,7 +2,10 @@ import { describe, expect, test } from 'bun:test'
 import { admitIntent, emptyRoom } from './room.ts'
 import {
   kindFor,
+  parseTodoWriteCall,
   parseTriage,
+  PLAN_SYSTEM_PROMPT,
+  TODO_WRITE_TOOL,
   triageBody,
   triageComment,
   TRIAGE_SYSTEM_PROMPT,
@@ -47,6 +50,9 @@ describe('triageBody', () => {
     ['Please tighten this paragraph.', 'new_action', null],
     ['Does this work?', 'chat', null],
     ['What does this mean?', 'chat', null],
+    ['**Does this work?**', 'chat', null],
+    ['\\\n**Can you fix this?**', 'chat', null],
+    ['**No.**', 'correction', null],
     ['still thinking out loud', 'ignore', null],
     ['Maybe we should revise the intro.', 'ambiguous', null],
     ['This section is fine.', 'ignore', null],
@@ -79,6 +85,12 @@ describe('triageBody', () => {
 describe('triageComment', () => {
   test('a question in a new thread is chat', () => {
     expect(outcome(triageComment(comment(), emptyRoom('p')))).toBe('chat')
+  })
+
+  test('markdown emphasis does not hide a question', () => {
+    expect(outcome(triageComment(comment({ body: '**Does this work?**' }), emptyRoom('p')))).toBe(
+      'chat',
+    )
   })
 
   test('a request in a new thread is a new action', () => {
@@ -142,5 +154,80 @@ describe('kinds and parsing', () => {
   test('the classification prompt names every outcome', () => {
     for (const word of ['new_action', 'correction', 'chat', 'clarify', 'ignore'])
       expect(TRIAGE_SYSTEM_PROMPT).toContain(word)
+  })
+})
+
+describe('todo_write planning', () => {
+  test('request verbs reach new_action without the model', () => {
+    expect(outcome(triageBody('Summarize this paragraph: The budget is split three ways.', emptyRoom('p'), key))).toBe(
+      'new_action',
+    )
+    expect(outcome(triageBody('List the vendors named: Acme and Beta.', emptyRoom('p'), key))).toBe(
+      'new_action',
+    )
+    expect(outcome(triageBody('Describe the budget in one sentence.', emptyRoom('p'), key))).toBe(
+      'new_action',
+    )
+  })
+
+  test('a valid tool call becomes ordered plan steps', () => {
+    const steps = parseTodoWriteCall({
+      id: 'call_1',
+      name: 'todo_write',
+      arguments: {
+        steps: [
+          { key: 'draft', kind: 'draft_reply', description: 'Draft the summary' },
+          {
+            key: 'post',
+            kind: 'post_reply',
+            description: 'Post the summary',
+            dependsOn: ['draft'],
+          },
+        ],
+      },
+    })
+    expect(steps).toEqual([
+      { key: 'draft', kind: 'draft_reply', description: 'Draft the summary' },
+      {
+        key: 'post',
+        kind: 'post_reply',
+        description: 'Post the summary',
+        dependsOn: ['draft'],
+      },
+    ])
+  })
+
+  test('invalid tool calls are rejected', () => {
+    const call = (args: unknown) => ({ id: 'c', name: 'todo_write', arguments: args })
+    expect(parseTodoWriteCall(call({ steps: [] }))).toBeNull()
+    expect(parseTodoWriteCall(call({ steps: [{ key: 'a', kind: 'read_context', description: 'x' }] }))).toBeNull()
+    expect(
+      parseTodoWriteCall(
+        call({
+          steps: [
+            { key: 'a', kind: 'draft_reply', description: 'A' },
+            { key: 'a', kind: 'post_reply', description: 'B' },
+          ],
+        }),
+      ),
+    ).toBeNull()
+    expect(
+      parseTodoWriteCall(
+        call({
+          steps: [
+            { key: 'a', kind: 'draft_reply', description: 'A', dependsOn: ['b'] },
+            { key: 'b', kind: 'post_reply', description: 'B', dependsOn: ['a'] },
+          ],
+        }),
+      ),
+    ).toBeNull()
+    expect(parseTodoWriteCall({ id: 'c', name: 'other', arguments: { steps: [] } })).toBeNull()
+  })
+
+  test('the tool and prompt describe only executable step kinds', () => {
+    expect(TODO_WRITE_TOOL.name).toBe('todo_write')
+    expect(JSON.stringify(TODO_WRITE_TOOL.parameters)).toContain('draft_reply')
+    expect(PLAN_SYSTEM_PROMPT).toContain('draft_reply')
+    expect(PLAN_SYSTEM_PROMPT).not.toContain('read_context')
   })
 })

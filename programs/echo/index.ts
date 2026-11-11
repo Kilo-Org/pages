@@ -6,30 +6,38 @@ import {
   type SelectionChange,
 } from '@pages-programs/sdk'
 import {
+  activateStep,
   applyTriage,
   attachThreadToIntent,
+  cancelPlan,
   clearSelection,
   closeIntentForThread,
   commentHandled,
   commitIsCurrent,
+  completePlan,
   emptyRoom,
-  findActiveIntentForTarget,
-  findIntentForThread,
   markCommentHandled,
-  markStepActive,
-  markStepDone,
   migrateNodes,
+  nextStep,
   noteSelection,
+  planIntent,
   recordBodyChange,
   recordCommentEvidence,
   recordTarget,
   removeTarget,
+  stepsForVersion,
+  type Intent,
+  type PlanStep,
+  type PlanStepInput,
   type RoomState,
   type TargetState,
 } from './room.ts'
 import {
   kindFor,
+  parseTodoWriteCall,
   parseTriage,
+  PLAN_SYSTEM_PROMPT,
+  TODO_WRITE_TOOL,
   triageBody,
   triageComment,
   triagePrompt,
@@ -74,10 +82,20 @@ const ROOM_LOCK = 'room-lock'
 async function loadRoom(ctx: ProgramContext, pageId = ''): Promise<RoomState> {
   const stored = await ctx.state.get<RoomState>(ROOM_KEY)
   if (stored && stored.schemaVersion === 1) {
+    const steps = Object.fromEntries(
+      Object.entries(stored.steps ?? {}).map(([id, step], index) => [
+        id,
+        {
+          ...step,
+          kind: step.kind ?? null,
+          position: typeof step.position === 'number' ? step.position : index,
+        },
+      ]),
+    )
     return {
       ...stored,
       intents: stored.intents ?? {},
-      steps: stored.steps ?? {},
+      steps,
       targets: stored.targets ?? {},
       selections: stored.selections ?? {},
       handledComments: stored.handledComments ?? {},
@@ -127,6 +145,7 @@ function withText(
     pageId,
     blockId: change.blockId,
     text,
+    previousText: prior?.text ?? null,
     changedAt: Date.now(),
     evaluatedText: null,
     failures: 0,
@@ -139,19 +158,25 @@ function withText(
   }
 }
 
-const SYSTEM_PROMPT = [
-  'You watch one block of text on a collaborative page. The author just paused.',
-  'Reply only if the text is a direct question, request, or unresolved TODO that calls for an answer.',
-  'Stay silent for statements, headings, code, or anything not addressed to a reader.',
-  'Respond with strict JSON only, no prose, no code fences: {"respond": boolean, "reply": string or null}.',
-  'When respond is true, reply is a short, direct answer (1-3 sentences). When false, reply is null.',
+const ANSWER_SYSTEM_PROMPT = [
+  'You are answering a question or request on a collaborative page.',
+  'Triage already decided the text needs a reply, so do not stay silent.',
+  'Answer it directly in 1-3 sentences. If it is too vague to answer, ask one short clarifying question.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string}.',
 ].join(' ')
 
 const COMMENT_SYSTEM_PROMPT = [
-  'You are answering a reply in one comment thread on a collaborative page.',
-  'Answer only if the message asks or requests something; stay silent for acknowledgements.',
-  'Respond with strict JSON only, no prose, no code fences: {"respond": boolean, "reply": string or null}.',
-  'When respond is true, reply is a short, direct answer (1-3 sentences).',
+  'You are answering a message in one comment thread on a collaborative page.',
+  'Triage already decided the message needs a reply, so do not stay silent.',
+  'Answer it, or ask one short clarifying question if it is too vague.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string}.',
+].join(' ')
+
+const CORRECTION_SYSTEM_PROMPT = [
+  'You are handling a correction to text on a collaborative page.',
+  'Use the previous text and the correction to work out what should change.',
+  'If the correction is still too vague to act on, ask one short, specific question.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string}.',
 ].join(' ')
 
 const CLARIFY_SYSTEM_PROMPT = [
@@ -225,6 +250,98 @@ function abortSpeculative(ctx: ProgramContext, key: string): void {
   }
 }
 
+/** A plan the executor can always run when the model cannot propose one. */
+function fallbackPlan(surface: 'body' | 'comment', hasReply: boolean): PlanStepInput[] {
+  if (surface === 'body' && hasReply) {
+    return [
+      { key: 'draft', kind: 'draft_reply', description: 'Draft the revised reply' },
+      {
+        key: 'edit',
+        kind: 'edit_reply',
+        description: 'Replace the previous reply',
+        dependsOn: ['draft'],
+      },
+    ]
+  }
+  return [
+    { key: 'draft', kind: 'draft_reply', description: 'Draft the reply' },
+    { key: 'post', kind: 'post_reply', description: 'Post the reply', dependsOn: ['draft'] },
+  ]
+}
+
+/**
+ * Asks the model for a plan through the `todo_write` tool. Returns null when
+ * the host has no tool support, the call fails, or the proposal is invalid;
+ * the caller then uses `fallbackPlan`.
+ */
+async function proposePlan(
+  ctx: ProgramContext,
+  input: {
+    surface: 'body' | 'comment'
+    outcome: 'new_action' | 'correction'
+    request: string
+    previousText: string | null
+    previousReply: string | null
+    hasReply: boolean
+    existingSteps: PlanStep[]
+  },
+  signal?: AbortSignal,
+): Promise<PlanStepInput[] | null> {
+  if (!ctx.llm?.completeWithTools) return null
+  try {
+    const result = await ctx.llm.completeWithTools({
+      system: PLAN_SYSTEM_PROMPT,
+      prompt: JSON.stringify({
+        surface: input.surface,
+        outcome: input.outcome,
+        request: input.request,
+        previousText: input.previousText,
+        previousReply: input.previousReply,
+        canEditReply: input.surface === 'body' && input.hasReply,
+        existingSteps: input.existingSteps.map((step) => ({
+          kind: step.kind,
+          description: step.description,
+          status: step.status,
+        })),
+      }),
+      tools: [TODO_WRITE_TOOL],
+      toolChoice: 'required',
+      ...(signal ? { signal } : {}),
+    })
+    const call = result.toolCalls.find((candidate) => candidate.name === 'todo_write')
+    const parsed = call ? parseTodoWriteCall(call) : null
+    const executable =
+      parsed?.every((step) =>
+        step.kind === 'edit_reply'
+          ? input.surface === 'body' && input.hasReply
+          : step.kind === 'post_reply'
+            ? input.surface === 'comment' || !input.hasReply
+            : true,
+      ) ?? false
+    if (!parsed || !executable) {
+      ctx.log('todo_write returned no executable plan; using the fallback plan')
+      return null
+    }
+    return parsed
+  } catch (error) {
+    if (isAbortError(error)) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    ctx.log(`todo_write failed: ${message}; using the fallback plan`)
+    return null
+  }
+}
+
+/** Plans an action/correction and activates the first step. */
+function installPlan(
+  room: RoomState,
+  intent: Intent,
+  steps: PlanStepInput[],
+): RoomState {
+  const planned = planIntent(room, intent.id, intent.version, steps)
+  const step = nextStep(planned, intent.id)
+  return step ? activateStep(planned, step.id) : planned
+}
+
 function isAbortError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError'
 }
@@ -274,7 +391,7 @@ async function describe(
  * incomplete text, but recognizing when text already looks complete rather than waiting out
  * a timer regardless. Text without trailing punctuation still falls back to the pause.
  */
-const looksComplete = (text: string) => /[?.!]\s*$/.test(text.trim())
+const looksComplete = (text: string) => /[?.!][\s*_~`)\]}"'”’]*$/.test(text.trim())
 
 /** Exponential backoff after `failures` consecutive attempts, starting at SPECULATIVE_PAUSE_MS, capped at MAX_BACKOFF_MS. */
 const backoffFor = (failures: number) =>
@@ -290,9 +407,11 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
     const snapshot = await loadRoom(ctx, base.pageId)
     const verdict = triageBody(base.text, snapshot, key)
     const triage = await resolveTriage(ctx, verdict, 'body', base.text, snapshot, key, signal)
+    if (triage.outcome !== 'ignore')
+      ctx.log(`triage ${base.blockId.slice(0, 8)}: ${triage.outcome} (${triage.source}) ${triage.reason}`)
     const now = new Date().toISOString()
-    const intentId = await updateRoom(ctx, base.pageId, (room) => {
-      const next = applyTriage(
+    const applied = await updateRoom(ctx, base.pageId, (room) => {
+      const result = applyTriage(
         room,
         {
           intentId: triage.intentId,
@@ -304,15 +423,21 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         now,
         false,
       )
-      const intent = findActiveIntentForTarget(next, key)
-      const target = next.targets[key]
+      const intent = result.intent
+      const target = result.room.targets[key]
       const withFence =
         intent && target
-          ? recordTarget(next, { ...target, assumedIntentVersion: intent.version })
-          : next
+          ? recordTarget(result.room, { ...target, assumedIntentVersion: intent.version })
+          : result.room
       return {
-        room: intent ? markStepActive(withFence, intent.id) : withFence,
-        value: intent?.id ?? null,
+        room: withFence,
+        value: {
+          intent,
+          steps: intent ? stepsForVersion(withFence, intent.id, intent.version) : [],
+          priorSteps: intent
+            ? stepsForVersion(withFence, intent.id, intent.version - 1)
+            : [],
+        },
       }
     })
     if (triage.outcome === 'ignore') {
@@ -332,17 +457,67 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       ctx.log(`ignored ${base.blockId.slice(0, 8)}: ${triage.reason}`)
       return
     }
+    const hasReply = Boolean(base.threadId && base.lastReply)
+    const plansIntent =
+      applied.intent !== undefined &&
+      (triage.outcome === 'new_action' || triage.outcome === 'correction')
+    if (plansIntent) {
+      const current = applied.intent!
+      let planned = false
+      if (applied.steps.length === 0) {
+        const proposal = await proposePlan(
+          ctx,
+          {
+            surface: 'body',
+            outcome: triage.outcome as 'new_action' | 'correction',
+            request: base.text,
+            previousText: base.previousText,
+            previousReply: base.lastReply,
+            hasReply,
+            existingSteps: applied.priorSteps,
+          },
+          signal,
+        )
+        planned = await updateRoom(ctx, base.pageId, (room) => {
+          const intent = room.intents[current.id]
+          if (!intent || intent.version !== current.version) return { room, value: false }
+          if (stepsForVersion(room, intent.id, intent.version).length > 0)
+            return { room, value: false }
+          return {
+            room: installPlan(room, intent, proposal ?? fallbackPlan('body', hasReply)),
+            value: true,
+          }
+        })
+      }
+      if (!planned) {
+        await updateRoom(ctx, base.pageId, (room) => {
+          const intent = room.intents[current.id]
+          if (!intent || intent.version !== current.version) return { room, value: undefined }
+          const step = nextStep(room, intent.id)
+          return { room: step ? activateStep(room, step.id) : room, value: undefined }
+        })
+      }
+    }
     const system =
       triage.outcome === 'clarify'
         ? CLARIFY_SYSTEM_PROMPT
-        : base.threadId
-          ? FOLLOWUP_SYSTEM_PROMPT
-          : SYSTEM_PROMPT
-    const prompt = base.threadId
-      ? `Previous reply: ${JSON.stringify(base.lastReply)}\n\nCurrent text: ${base.text}`
-      : base.text
+        : triage.outcome === 'correction'
+          ? hasReply
+            ? FOLLOWUP_SYSTEM_PROMPT
+            : CORRECTION_SYSTEM_PROMPT
+          : ANSWER_SYSTEM_PROMPT
+    const promptParts: string[] = []
+    if (triage.outcome === 'correction' && base.previousText)
+      promptParts.push(`Previous text: ${JSON.stringify(base.previousText)}`)
+    if (hasReply) promptParts.push(`Previous reply: ${JSON.stringify(base.lastReply)}`)
+    const prompt =
+      promptParts.length > 0
+        ? `${promptParts.join('\n\n')}\n\nCurrent text: ${JSON.stringify(base.text)}`
+        : base.text
     const raw = await ctx.llm!.complete({ system, prompt, signal })
     const decision = parseDecision(raw)
+    if (!decision.respond || !decision.reply)
+      ctx.log(`declined ${base.blockId.slice(0, 8)}: triage ${triage.outcome}`)
     const outcome = await updateRoom(ctx, base.pageId, async (room) => {
       const fresh = room.targets[key]
       const current = commitIsCurrent(room, key, {
@@ -373,8 +548,14 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         messageId,
         lastReply,
       })
+      const intentId = applied.intent?.id
       if (intentId && threadId) nextRoom = attachThreadToIntent(nextRoom, intentId, threadId)
-      if (intentId) nextRoom = markStepDone(nextRoom, intentId)
+      if (plansIntent && intentId) {
+        nextRoom =
+          decision.respond && decision.reply
+            ? completePlan(nextRoom, intentId)
+            : cancelPlan(nextRoom, intentId)
+      }
       return { room: nextRoom, value: 'written' as const }
     })
     if (outcome === 'discarded') {
@@ -428,38 +609,43 @@ async function handleComment(
     snapshot,
     null,
   )
-  const intentId = await updateRoom(ctx, pageId, (room) => {
-    const next = applyTriage(
-      room,
-      {
-        intentId: triage.intentId,
-        kind: kindFor(triage.outcome),
-        targetScope: {
-          pageId,
-          ...(change.blockId ? { blockId: change.blockId } : {}),
-          threadId: change.threadId,
-        },
-        confidence: triage.confidence,
-        evidence: { eventId, at, messageId: change.messageId! },
-      },
-      at,
-      true,
-    )
-    const intent = findIntentForThread(next, change.threadId)
-    return { room: intent ? markStepActive(next, intent.id) : next, value: intent?.id ?? null }
-  })
-
-  const markHandled = () =>
-    updateRoom(ctx, pageId, (room) => {
-      let next = markCommentHandled(room, change.threadId, handleKey)
-      if (intentId) next = markStepDone(next, intentId)
-      return { room: next, value: undefined }
-    })
+  const where = change.threadId.slice(0, 8)
+  if (triage.outcome !== 'ignore')
+    ctx.log(`triage comment ${where}: ${triage.outcome} (${triage.source}) ${triage.reason}`)
 
   if (triage.outcome === 'ignore') {
-    await markHandled()
-    ctx.log(`ignored comment ${change.threadId.slice(0, 8)}: ${triage.reason}`)
+    await updateRoom(ctx, pageId, (room) => ({
+      room: markCommentHandled(room, change.threadId, handleKey),
+      value: undefined,
+    }))
+    ctx.log(`ignored comment ${where}: ${triage.reason}`)
     return
+  }
+
+  const plansIntent = triage.outcome === 'new_action' || triage.outcome === 'correction'
+  const prior = triage.intentId ? snapshot.intents[triage.intentId] : undefined
+  const proposal = plansIntent
+    ? await proposePlan(ctx, {
+        surface: 'comment',
+        outcome: triage.outcome as 'new_action' | 'correction',
+        request: change.body ?? '',
+        previousText: null,
+        previousReply: null,
+        hasReply: false,
+        existingSteps: prior ? stepsForVersion(snapshot, prior.id, prior.version) : [],
+      })
+    : null
+  const scope = {
+    pageId,
+    ...(change.blockId ? { blockId: change.blockId } : {}),
+    threadId: change.threadId,
+  }
+  const triageInput = {
+    intentId: triage.intentId,
+    kind: kindFor(triage.outcome),
+    targetScope: scope,
+    confidence: triage.confidence,
+    evidence: { eventId, at, messageId: change.messageId! },
   }
 
   const raw = await ctx.llm!.complete({
@@ -468,25 +654,54 @@ async function handleComment(
   })
   const decision = parseDecision(raw)
   if (!decision.respond || !decision.reply) {
-    await markHandled()
+    await updateRoom(ctx, pageId, (room) => {
+      const applied = applyTriage(room, triageInput, at, true)
+      let settled = markCommentHandled(applied.room, change.threadId, handleKey)
+      if (plansIntent && applied.intent) {
+        settled = planIntent(
+          settled,
+          applied.intent.id,
+          applied.intent.version,
+          proposal ?? fallbackPlan('comment', false),
+        )
+        settled = cancelPlan(settled, applied.intent.id)
+      }
+      return { room: settled, value: undefined }
+    })
+    ctx.log(`declined comment ${where}: triage ${triage.outcome}`)
     return
   }
 
   const result = await updateRoom(ctx, pageId, async (room) => {
     if (commentHandled(room, change.threadId, handleKey))
       return { room, value: 'duplicate' as const }
-    const posted = await ctx.comments!.replyToThread({
+    const applied = applyTriage(room, triageInput, at, true)
+    let next = applied.room
+    const intent = applied.intent
+    if (plansIntent && intent) {
+      next = planIntent(
+        next,
+        intent.id,
+        intent.version,
+        proposal ?? fallbackPlan('comment', false),
+      )
+      const step = nextStep(next, intent.id)
+      if (step) next = activateStep(next, step.id)
+    }
+    await ctx.comments!.replyToThread({
       threadId: change.threadId,
       body: decision.reply!,
       dedupeOn: handleKey,
     })
-    let next = markCommentHandled(room, change.threadId, handleKey)
-    if (intentId) next = attachThreadToIntent(next, intentId, change.threadId)
-    if (intentId) next = markStepDone(next, intentId)
+    next = markCommentHandled(next, change.threadId, handleKey)
+    if (intent) {
+      next = attachThreadToIntent(next, intent.id, change.threadId)
+      if (plansIntent) next = completePlan(next, intent.id)
+    }
     return { room: next, value: 'posted' as const }
   })
   if (result === 'posted')
-    ctx.log(`replied in thread ${change.threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
+    ctx.log(`replied in thread ${where}: ${JSON.stringify(decision.reply)}`)
 }
 
 function describeComment(change: CommentChange): string {
