@@ -13,8 +13,55 @@ export type NodeChange = {
   markdown: string | null
 }
 
+/** Who produced a change, as far as Pages can tell. Page content reads expose
+ * no author; comment/selection author labels are unverified. */
+export type ActorKind = 'person' | 'agent' | 'unknown'
+
+/** 1 user input, 2 context/unknown, 3 agent progress, 4 background. */
+export type ChangePriority = 1 | 2 | 3 | 4
+
+export type BodyChange = NodeChange & {
+  surface: 'body'
+  actorKind: 'unknown'
+  priority: ChangePriority
+}
+
+export type CommentChange = {
+  surface: 'comment'
+  change: 'inserted' | 'updated' | 'deleted' | (string & {})
+  threadId: string
+  /** null for a deleted thread. */
+  messageId: string | null
+  blockId: string | null
+  body: string | null
+  authorPrincipal: string | null
+  authorDisplayName: string | null
+  driver: string | null
+  actorKind: ActorKind
+  priority: ChangePriority
+}
+
+export type SelectionChange = {
+  surface: 'selection'
+  change: 'selected' | 'updated' | 'cleared'
+  peerId: string
+  principal: string
+  displayName: string | null
+  driver: string | null
+  blockId: string
+  kind: 'caret' | 'selection' | null
+  startUtf16: number | null
+  endUtf16: number | null
+  quote: string | null
+  observedAt: string
+  actorKind: ActorKind
+  priority: ChangePriority
+}
+
+export type PageChange = BodyChange | CommentChange | SelectionChange
+
 export type PageChangedEvent = {
-  /** Stable across redeliveries: page plus the heads the change was observed at. */
+  /** Stable across redeliveries: page plus the heads/selection epoch observed. */
   id: string
   type: 'page.changed'
   at: string
@@ -23,7 +70,11 @@ export type PageChangedEvent = {
   titleChanged: boolean
   fromHeads: string[]
   toHeads: string[]
-  changes: NodeChange[]
+  fromCommentHeads: string[] | null
+  toCommentHeads: string[] | null
+  /** Monotonic local counter; presence has no server revision. */
+  selectionEpoch: number
+  changes: PageChange[]
 }
 
 export type ProgramEvent = PageChangedEvent

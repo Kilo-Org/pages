@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import echo, { attempt, looksComplete, SPECULATIVE_PAUSE_MS, textDelta } from './index.ts'
-import type { CommentsCapability, LlmCapability, NodeChange, PageChangedEvent, ProgramContext } from '@pages-programs/sdk'
+import type {
+  BodyChange,
+  CommentsCapability,
+  LlmCapability,
+  PageChange,
+  PageChangedEvent,
+  ProgramContext,
+} from '@pages-programs/sdk'
 
 function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability }) {
   const lines: string[] = []
@@ -86,7 +93,8 @@ function fakeComments(): CommentsCapability & {
   }
 }
 
-const node = (change: NodeChange['change'], markdown: string | null): NodeChange => ({
+const node = (change: BodyChange['change'], markdown: string | null): BodyChange => ({
+  surface: 'body',
   scope: 'node',
   blockId: 'b1',
   change,
@@ -94,10 +102,12 @@ const node = (change: NodeChange['change'], markdown: string | null): NodeChange
   nodeId: null,
   type: 'paragraph',
   markdown,
+  actorKind: 'unknown',
+  priority: 2,
 })
 
-const event = (n: number, changes: NodeChange[]): PageChangedEvent => ({
-  id: `p@${n}`,
+const event = (n: number, changes: PageChange[]): PageChangedEvent => ({
+  id: `p@${n}+c:+s:0`,
   type: 'page.changed',
   at: '2026-11-09T00:00:00.000Z',
   pageId: 'p',
@@ -105,6 +115,9 @@ const event = (n: number, changes: NodeChange[]): PageChangedEvent => ({
   titleChanged: false,
   fromHeads: [`h${n - 1}`],
   toHeads: [`h${n}`],
+  fromCommentHeads: null,
+  toCommentHeads: null,
+  selectionEpoch: 0,
   changes,
 })
 
@@ -173,6 +186,57 @@ describe('echo program', () => {
     await echo.handle(event(1, [node('updated', 'Hello world')]), ctx)
     expect(lines).toEqual(['first sight of paragraph: "Hello world"'])
     expect(kv['nodes/b1:0']).toMatchObject({ text: 'Hello world', evaluatedText: null, failures: 0 })
+  })
+
+  test('logs comment changes without treating them as node text', async () => {
+    const { lines, kv, ctx } = harness()
+    await echo.handle(
+      event(1, [
+        {
+          surface: 'comment',
+          change: 'inserted',
+          threadId: 't1',
+          messageId: 'm1',
+          blockId: 'b1',
+          body: 'Can you tighten this?',
+          authorPrincipal: 'person-1',
+          authorDisplayName: 'Person',
+          driver: 'Browser',
+          actorKind: 'person',
+          priority: 1,
+        },
+      ]),
+      ctx,
+    )
+    expect(lines).toEqual(['comment t1 inserted by Browser: "Can you tighten this?"'])
+    expect(Object.keys(kv)).toEqual([])
+  })
+
+  test('logs selection changes without scheduling a reply', async () => {
+    const { lines, kv, ctx } = harness()
+    await echo.handle(
+      event(1, [
+        {
+          surface: 'selection',
+          change: 'selected',
+          peerId: 'peer-1',
+          principal: 'person-1',
+          displayName: 'Person',
+          driver: 'Browser',
+          blockId: 'b1',
+          kind: 'selection',
+          startUtf16: 0,
+          endUtf16: 3,
+          quote: 'abc',
+          observedAt: '2026-11-10T00:00:00.000Z',
+          actorKind: 'person',
+          priority: 2,
+        },
+      ]),
+      ctx,
+    )
+    expect(lines).toEqual(['selection b1 selected (selection) by Browser: "abc"'])
+    expect(Object.keys(kv)).toEqual([])
   })
 })
 

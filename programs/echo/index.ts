@@ -1,4 +1,10 @@
-import { defineProgram, type NodeChange, type ProgramContext } from '@pages-programs/sdk'
+import {
+  defineProgram,
+  type BodyChange,
+  type CommentChange,
+  type ProgramContext,
+  type SelectionChange,
+} from '@pages-programs/sdk'
 
 export type TextDelta = { removed: string; added: string }
 
@@ -16,7 +22,7 @@ export function textDelta(before: string, after: string): TextDelta {
   return { removed: before.slice(start, endBefore), added: after.slice(start, endAfter) }
 }
 
-const nodeKey = (change: NodeChange) => `nodes/${change.blockId}:${change.nodeId ?? change.nodeIndex ?? 0}`
+const nodeKey = (change: BodyChange) => `nodes/${change.blockId}:${change.nodeId ?? change.nodeIndex ?? 0}`
 
 /**
  * How long text must sit unchanged before we're willing to START a speculative draft.
@@ -109,7 +115,7 @@ function isAbortError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError'
 }
 
-async function describe(change: NodeChange, ctx: ProgramContext): Promise<string | null> {
+async function describe(change: BodyChange, ctx: ProgramContext): Promise<string | null> {
   if (change.scope === 'block') return `block ${change.blockId.slice(0, 8)} ${change.change}`
   const key = nodeKey(change)
   if (change.change === 'deleted') {
@@ -190,6 +196,19 @@ async function attempt(key: string, base: NodeRecord, ctx: ProgramContext, signa
   }
 }
 
+function describeComment(change: CommentChange): string {
+  const by = change.driver ?? change.authorPrincipal ?? 'unknown'
+  const where = change.threadId.slice(0, 8)
+  if (change.change === 'deleted') return `comment ${where} deleted`
+  return `comment ${where} ${change.change} by ${by}: ${JSON.stringify(change.body ?? '')}`
+}
+
+function describeSelection(change: SelectionChange): string {
+  const by = change.driver ?? change.principal
+  const text = change.quote ? `: ${JSON.stringify(change.quote)}` : ''
+  return `selection ${change.blockId.slice(0, 8)} ${change.change} (${change.kind ?? 'selection'}) by ${by}${text}`
+}
+
 export { attempt, looksComplete, SPECULATIVE_PAUSE_MS }
 
 export default defineProgram({
@@ -198,6 +217,14 @@ export default defineProgram({
   async handle(event, ctx) {
     if (event.titleChanged) ctx.log(`title → ${JSON.stringify(event.title)}`)
     for (const change of event.changes) {
+      if (change.surface === 'comment') {
+        ctx.log(describeComment(change))
+        continue
+      }
+      if (change.surface === 'selection') {
+        ctx.log(describeSelection(change))
+        continue
+      }
       const line = await describe(change, ctx)
       if (line) ctx.log(line)
     }
