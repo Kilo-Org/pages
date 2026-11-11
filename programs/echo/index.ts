@@ -6,9 +6,12 @@ import {
   type SelectionChange,
 } from '@pages-programs/sdk'
 import {
+  attachThreadToIntent,
   clearSelection,
   commitIsCurrent,
   emptyRoom,
+  findActiveIntentForTarget,
+  forgetThread,
   migrateNodes,
   noteSelection,
   recordBodyChange,
@@ -51,14 +54,31 @@ const MAX_BACKOFF_MS = 5 * 60_000
 const ROOM_KEY = 'room'
 const ROOM_LOCK = 'room-lock'
 
+function normalizeRoom(room: RoomState, pageId = ''): RoomState {
+  return {
+    ...room,
+    pageId: room.pageId || pageId,
+    intentSeq: room.intentSeq ?? 0,
+  }
+}
+
 /** Reads the room, upgrading PR 3's flat `nodes/*` records once. */
 async function loadRoom(ctx: ProgramContext, pageId = ''): Promise<RoomState> {
   const stored = await ctx.state.get<RoomState>(ROOM_KEY)
-  if (stored && stored.schemaVersion === 1) return stored
+  if (stored && stored.schemaVersion === 1) return normalizeRoom(stored, pageId)
   const records: Record<string, unknown> = {}
   for (const key of await ctx.state.list('nodes/')) records[key] = await ctx.state.get(key)
   if (Object.keys(records).length === 0) return emptyRoom(pageId || stored?.pageId || '')
   return migrateNodes(records, pageId || stored?.pageId || '')
+}
+
+/** Persists a one-time migration so tick does not re-read every legacy key. */
+async function ensureRoom(ctx: ProgramContext, pageId = ''): Promise<RoomState> {
+  const stored = await ctx.state.get<RoomState>(ROOM_KEY)
+  if (stored && stored.schemaVersion === 1) return normalizeRoom(stored, pageId)
+  const room = await loadRoom(ctx, pageId)
+  await ctx.state.set(ROOM_KEY, room)
+  return room
 }
 
 /**
@@ -80,6 +100,14 @@ async function updateRoom<T>(
   try {
     const room = await loadRoom(ctx, pageId)
     const next = await fn(room)
+    // Keep the legacy per-node records current while the room is introduced;
+    // a rollback to PR 3 then still has reply identity for new writes.
+    for (const [key, target] of Object.entries(next.room.targets)) {
+      if (room.targets[key] !== target) await ctx.state.set(key, target)
+    }
+    for (const key of Object.keys(room.targets)) {
+      if (!(key in next.room.targets)) await ctx.state.delete(key)
+    }
     await ctx.state.set(ROOM_KEY, next.room)
     return next.value
   } finally {
@@ -221,7 +249,7 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
   try {
     const raw = await ctx.llm!.complete({ system, prompt, signal })
     const decision = parseDecision(raw)
-    const outcome = await updateRoom(ctx, undefined, async (room) => {
+    const outcome = await updateRoom(ctx, base.pageId, async (room) => {
       const fresh = room.targets[key]
       const current = commitIsCurrent(room, key, {
         text: base.text,
@@ -242,38 +270,48 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         }
         lastReply = decision.reply
       }
-      return {
-        room: recordTarget(room, {
-          ...fresh,
-          evaluatedText: fresh.text,
-          failures: 0,
-          lastAttemptAt: Date.now(),
-          threadId,
-          messageId,
-          lastReply,
-        }),
-        value: 'written' as const,
+      let nextRoom = recordTarget(room, {
+        ...fresh,
+        evaluatedText: fresh.text,
+        failures: 0,
+        lastAttemptAt: Date.now(),
+        threadId,
+        messageId,
+        lastReply,
+      })
+      if (threadId) {
+        const intent = findActiveIntentForTarget(nextRoom, key)
+        if (intent) nextRoom = attachThreadToIntent(nextRoom, intent.id, threadId)
       }
+      return { room: nextRoom, value: 'written' as const }
     })
     if (outcome === 'discarded') {
       ctx.log(`draft for ${base.blockId.slice(0, 8)} discarded: text or intent moved on before it was ready`)
     }
   } catch (error) {
     if (isAbortError(error)) return // intentional cancel — not a failure, nothing to record
-    const snapshot = await loadRoom(ctx)
+    const snapshot = await loadRoom(ctx, base.pageId)
     const fresh = snapshot.targets[key] ?? base
     const failures = fresh.failures + 1
     const message = error instanceof Error ? error.message : String(error)
     ctx.log(`decide/reply failed (attempt ${failures}), backing off ${backoffFor(failures)}ms: ${message}`)
     // Don't mark evaluated — retry later, at an increasing delay, instead of giving up or hot-looping.
-    await updateRoom(ctx, undefined, (room) => {
+    // A failure for text that has already moved on must not be charged to the new text.
+    const recorded = await updateRoom(ctx, base.pageId, (room) => {
       const target = room.targets[key]
-      if (!target) return { room, value: undefined }
+      if (!target) return { room, value: false }
+      if (target.text !== base.text || target.generation !== base.generation)
+        return { room, value: false }
       return {
-        room: recordTarget(room, { ...target, failures, lastAttemptAt: Date.now() }),
-        value: undefined,
+        room: recordTarget(room, {
+          ...target,
+          failures: target.failures + 1,
+          lastAttemptAt: Date.now(),
+        }),
+        value: true,
       }
     })
+    if (!recorded) ctx.log(`failure for ${base.blockId.slice(0, 8)} discarded: text moved on`)
   }
 }
 
@@ -300,7 +338,10 @@ export default defineProgram({
     for (const change of event.changes) {
       if (change.surface === 'comment') {
         await updateRoom(ctx, event.pageId, (room) => ({
-          room: recordCommentEvidence(room, change, event.id, event.at),
+          room:
+            change.change === 'deleted'
+              ? forgetThread(room, change.threadId)
+              : recordCommentEvidence(room, change, event.id, event.at),
           value: undefined,
         }))
         ctx.log(describeComment(change))
@@ -323,7 +364,7 @@ export default defineProgram({
   },
   async tick(ctx) {
     if (!ctx.llm || !ctx.comments) return // no model/write capability configured — nothing to do
-    const room = await loadRoom(ctx)
+    const room = await ensureRoom(ctx, ctx.pageId ?? '')
     const now = Date.now()
     for (const [key, record] of Object.entries(room.targets)) {
       const inFlight = ctx.scratch.get<SpeculativeAttempt>(key)

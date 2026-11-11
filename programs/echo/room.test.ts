@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import {
   admitIntent,
+  attachThreadToIntent,
   bumpIntentVersion,
   cancelStaleSteps,
   clearSelection,
+  closeIntentForTarget,
+  forgetThread,
   commitIsCurrent,
   emptyRoom,
   findActiveIntentForTarget,
@@ -51,7 +54,7 @@ const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
 })
 
 describe('intents', () => {
-  test('admitIntent creates an active version 1 intent with a deterministic id', () => {
+  test('admitIntent creates an active version 1 intent with a sequential id', () => {
     const { room, intent } = admitIntent(
       emptyRoom('p'),
       {
@@ -63,7 +66,8 @@ describe('intents', () => {
       },
       at,
     )
-    expect(intent).toMatchObject({ id: 'nodes/b1:0:action', version: 1, status: 'active' })
+    expect(intent).toMatchObject({ id: 'nodes/b1:0:action:1', version: 1, status: 'active' })
+    expect(room.intentSeq).toBe(1)
     expect(room.intents[intent.id]).toEqual(intent)
     expect(findActiveIntentForTarget(room, 'nodes/b1:0')?.id).toBe(intent.id)
   })
@@ -132,7 +136,7 @@ describe('targets and the commit fence', () => {
       at,
     )
     const room = recordTarget(admitted.room, target({ generation: 3 }))
-    const next = noteUserChange(room, 'nodes/b1:0', admitted.intent.id, at)
+    const next = noteUserChange(room, 'nodes/b1:0', admitted.intent.id)
     expect(next.targets['nodes/b1:0']).toMatchObject({
       generation: 4,
       assumedIntentVersion: 1,
@@ -195,6 +199,83 @@ describe('targets and the commit fence', () => {
       generation: 2,
       assumedIntentVersion: 2,
     })
+  })
+
+  test('a new admission after abandonment keeps both intents', () => {
+    const first = admitIntent(
+      emptyRoom('p'),
+      {
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [],
+      },
+      at,
+    )
+    const abandoned = closeIntentForTarget(first.room, 'nodes/b1:0')
+    const second = admitIntent(
+      abandoned,
+      {
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [],
+      },
+      at,
+    )
+    expect(first.intent.id).not.toBe(second.intent.id)
+    expect(second.room.intents[first.intent.id]?.status).toBe('abandoned')
+    expect(second.room.intents[second.intent.id]).toMatchObject({ version: 1, status: 'active' })
+  })
+
+  test('forgetThread clears reply identity and abandons the thread intent', () => {
+    const admitted = admitIntent(
+      emptyRoom('p'),
+      {
+        kind: 'action',
+        targetScope: {
+          pageId: 'p',
+          blockId: 'b1',
+          nodeKey: 'nodes/b1:0',
+          threadId: 't1',
+        },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [],
+      },
+      at,
+    )
+    const room = recordTarget(
+      admitted.room,
+      target({ threadId: 't1', messageId: 'm1', lastReply: 'old', evaluatedText: 'Hello' }),
+    )
+    const next = forgetThread(room, 't1')
+    expect(next.targets['nodes/b1:0']).toMatchObject({
+      threadId: null,
+      messageId: null,
+      lastReply: null,
+      evaluatedText: 'Hello',
+    })
+    expect(next.intents[admitted.intent.id]?.status).toBe('abandoned')
+  })
+
+  test('attachThreadToIntent fills the scope once', () => {
+    const admitted = admitIntent(
+      emptyRoom('p'),
+      {
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [],
+      },
+      at,
+    )
+    const attached = attachThreadToIntent(admitted.room, admitted.intent.id, 't1')
+    expect(attached.intents[admitted.intent.id]?.targetScope.threadId).toBe('t1')
+    expect(attachThreadToIntent(attached, admitted.intent.id, 't1')).toBe(attached)
   })
 
   test('removeTarget abandons its intent', () => {
@@ -260,7 +341,7 @@ describe('comments and selections as evidence', () => {
     expect(recordCommentEvidence(room, change, 'e1', at)).toBe(room)
   })
 
-  test('noteSelection records scope evidence and clearSelection removes it', () => {
+  test('noteSelection keeps one evidence ref per peer and clear removes it', () => {
     const { room, id } = withIntent()
     const change = {
       surface: 'selection' as const,
@@ -282,7 +363,66 @@ describe('comments and selections as evidence', () => {
     expect(next.selections['peer-1']).toMatchObject({ blockId: 'b1', quote: 'abc' })
     expect(next.intents[id]?.evidence).toHaveLength(1)
     expect(next.intents[id]?.version).toBe(1)
-    expect(clearSelection(next, 'peer-1').selections['peer-1']).toBeUndefined()
+
+    const moved = noteSelection(next, {
+      ...change,
+      change: 'updated',
+      startUtf16: 4,
+      endUtf16: 7,
+      quote: 'def',
+      observedAt: '2026-11-10T00:00:01.000Z',
+    })
+    expect(moved.selections['peer-1']).toMatchObject({ quote: 'def' })
+    expect(moved.intents[id]?.evidence).toHaveLength(1)
+
+    const cleared = clearSelection(moved, 'peer-1')
+    expect(cleared.selections['peer-1']).toBeUndefined()
+    expect(cleared.intents[id]?.evidence).toHaveLength(0)
+  })
+
+  test('moving a selection to another block moves its evidence', () => {
+    const first = admitIntent(
+      emptyRoom('p'),
+      {
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [],
+      },
+      at,
+    )
+    const room = admitIntent(
+      first.room,
+      {
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b2', nodeKey: 'nodes/b2:0' },
+        outputKind: 'comment',
+        confidence: 1,
+        evidence: [],
+      },
+      at,
+    ).room
+    const change = {
+      surface: 'selection' as const,
+      change: 'selected' as const,
+      peerId: 'peer-1',
+      principal: 'person-1',
+      displayName: 'Person',
+      driver: 'Browser',
+      blockId: 'b1',
+      kind: 'selection' as const,
+      startUtf16: 0,
+      endUtf16: 1,
+      quote: 'a',
+      observedAt: at,
+      actorKind: 'person' as const,
+      priority: 2 as const,
+    }
+    const onB1 = noteSelection(room, change)
+    const onB2 = noteSelection(onB1, { ...change, blockId: 'b2', quote: 'b' })
+    expect(onB2.intents[first.intent.id]?.evidence).toHaveLength(0)
+    expect(onB2.intents[Object.keys(onB2.intents).find((id) => id !== first.intent.id)!]?.evidence).toHaveLength(1)
   })
 })
 

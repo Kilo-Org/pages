@@ -124,6 +124,8 @@ export type CommentsCapability = {
 }
 
 export type ProgramContext = {
+  /** The page this instance is watching. */
+  pageId?: string
   log(message: string, data?: Record<string, unknown>): void
   state: ProgramState
   scratch: ScratchState
