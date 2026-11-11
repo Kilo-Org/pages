@@ -1,12 +1,17 @@
 import { describe, expect, test } from 'bun:test'
 import {
   admitIntent,
+  applyTriage,
   bumpIntentVersion,
   cancelStaleSteps,
   clearSelection,
   commitIsCurrent,
   emptyRoom,
+  ensureStep,
   findActiveIntentForTarget,
+  findCurrentStep,
+  markStepActive,
+  markStepDone,
   migrateNodes,
   noteSelection,
   noteUserChange,
@@ -307,6 +312,71 @@ describe('comments and selections as evidence', () => {
     expect(next.intents[id]?.evidence).toHaveLength(1)
     expect(next.intents[id]?.version).toBe(1)
     expect(clearSelection(next, 'peer-1').selections['peer-1']).toBeUndefined()
+  })
+})
+
+describe('plan steps', () => {
+  const scope = { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' }
+
+  test('applyTriage admits an intent and its one current-version step, pending', () => {
+    const room = applyTriage(
+      emptyRoom('p'),
+      { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
+      at,
+      false,
+    )
+    const intentId = Object.keys(room.intents)[0]!
+    expect(room.steps[`${intentId}:1`]).toMatchObject({
+      intentId,
+      intentVersion: 1,
+      status: 'pending',
+      description: 'produce a reply addressing the request',
+    })
+  })
+
+  test('applyTriage with bump: true cancels the prior stale step and admits a fresh one', () => {
+    const admitted = applyTriage(
+      emptyRoom('p'),
+      { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
+      at,
+      false,
+    )
+    const intentId = Object.keys(admitted.intents)[0]!
+    const bumped = applyTriage(
+      admitted,
+      { intentId, kind: 'correction', targetScope: scope, confidence: 0.8, evidence: { eventId: 'e2', at } },
+      at,
+      true,
+    )
+    expect(bumped.intents[intentId]?.version).toBe(2)
+    expect(bumped.steps[`${intentId}:1`]?.status).toBe('cancelled')
+    expect(bumped.steps[`${intentId}:2`]).toMatchObject({
+      status: 'pending',
+      description: 'revise the reply for the corrected request',
+    })
+  })
+
+  test('ensureStep relabels the current step in place instead of resetting its status', () => {
+    const admitted = applyTriage(
+      emptyRoom('p'),
+      { intentId: null, kind: 'action', targetScope: scope, confidence: 0.9, evidence: { eventId: 'e1', at } },
+      at,
+      false,
+    )
+    const intentId = Object.keys(admitted.intents)[0]!
+    const active = markStepActive(admitted, intentId)
+    const relabeled = ensureStep(active, intentId, 'answer the question')
+    expect(relabeled.steps[`${intentId}:1`]).toMatchObject({
+      status: 'active',
+      description: 'answer the question',
+    })
+  })
+
+  test('markStepActive/markStepDone are no-ops without a current step', () => {
+    const room = emptyRoom('p')
+    expect(markStepActive(room, 'missing')).toBe(room)
+    expect(markStepDone(room, 'missing')).toBe(room)
+    expect(findCurrentStep(room, 'missing')).toBeUndefined()
   })
 })
 

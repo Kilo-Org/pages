@@ -103,6 +103,21 @@ export const emptyRoom = (pageId = ''): RoomState => ({
 const scopeKey = (scope: TargetScope) =>
   scope.threadId ?? scope.nodeKey ?? scope.blockId ?? 'page'
 
+const stepId = (intentId: string, version: number) => `${intentId}:${version}`
+
+const describeStep = (kind: IntentKind): string => {
+  switch (kind) {
+    case 'action':
+      return 'produce a reply addressing the request'
+    case 'correction':
+      return 'revise the reply for the corrected request'
+    case 'chat':
+      return 'answer the question'
+    case 'clarify':
+      return 'ask a clarifying question'
+  }
+}
+
 const copyTargets = (room: RoomState, targets: Record<string, TargetState>): RoomState => ({
   ...room,
   targets,
@@ -204,16 +219,18 @@ export function applyTriage(
       },
       now,
     )
-    return admitted.room
+    return ensureStep(admitted.room, admitted.intent.id, describeStep(input.kind))
   }
-  const based = bump ? bumpIntentVersion(room, intent.id, input.evidence, now) : room
+  const based = bump
+    ? cancelStaleSteps(bumpIntentVersion(room, intent.id, input.evidence, now), intent.id)
+    : room
   const current = based.intents[intent.id] ?? intent
   const evidence = bump
     ? current.evidence
     : current.evidence.some((ref) => ref.eventId === input.evidence.eventId)
       ? current.evidence
       : [...current.evidence, input.evidence]
-  return copyIntents(based, {
+  const updated = copyIntents(based, {
     ...based.intents,
     [intent.id]: {
       ...current,
@@ -223,6 +240,7 @@ export function applyTriage(
       updatedAt: now,
     },
   })
+  return ensureStep(updated, intent.id, describeStep(input.kind))
 }
 
 export function admitIntent(
@@ -301,6 +319,54 @@ export function cancelStaleSteps(room: RoomState, intentId: string): RoomState {
     }),
   )
   return changed ? { ...room, steps } : room
+}
+
+/** The one plan step for an intent's current version — the unit of work the executor owes it. */
+export function findCurrentStep(room: RoomState, intentId: string): PlanStep | undefined {
+  const intent = room.intents[intentId]
+  return intent ? room.steps[stepId(intentId, intent.version)] : undefined
+}
+
+/**
+ * Creates the current version's step if it doesn't exist yet, or refreshes its
+ * description if triage relabeled the intent's kind without bumping the version.
+ * Leaves status/owner alone either way.
+ */
+export function ensureStep(room: RoomState, intentId: string, description: string): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent) return room
+  const id = stepId(intentId, intent.version)
+  const existing = room.steps[id]
+  if (existing && existing.description === description) return room
+  const step: PlanStep = existing
+    ? { ...existing, description }
+    : {
+        id,
+        intentId,
+        intentVersion: intent.version,
+        status: 'pending',
+        description,
+        owner: null,
+        dependsOn: [],
+        assumedRevision: null,
+      }
+  return { ...room, steps: { ...room.steps, [id]: step } }
+}
+
+export function setStepStatus(room: RoomState, id: string, status: StepStatus): RoomState {
+  const step = room.steps[id]
+  if (!step || step.status === status) return room
+  return { ...room, steps: { ...room.steps, [id]: { ...step, status } } }
+}
+
+export function markStepActive(room: RoomState, intentId: string): RoomState {
+  const step = findCurrentStep(room, intentId)
+  return step ? setStepStatus(room, step.id, 'active') : room
+}
+
+export function markStepDone(room: RoomState, intentId: string): RoomState {
+  const step = findCurrentStep(room, intentId)
+  return step ? setStepStatus(room, step.id, 'done') : room
 }
 
 export function noteUserChange(

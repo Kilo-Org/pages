@@ -773,3 +773,74 @@ describe('triage wiring', () => {
     expect(comments.replies).toEqual([])
   })
 })
+
+describe('plan steps — the to-do list behind an intent', () => {
+  test('a body action creates a step, active while the model drafts, done once the reply posts', async () => {
+    const d = deferredLlm()
+    const { kv, ctx } = harness({ llm: d.llm, comments: fakeComments() })
+    await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const intentId = Object.keys((kv.room as RoomState).intents)[0]!
+    const stepId = `${intentId}:1`
+    expect((kv.room as RoomState).steps[stepId]).toMatchObject({
+      intentId,
+      intentVersion: 1,
+      status: 'active',
+      description: 'produce a reply addressing the request',
+    })
+
+    d.resolve({ respond: true, reply: 'Done.' })
+    await flush()
+    expect((kv.room as RoomState).steps[stepId]?.status).toBe('done')
+  })
+
+  test('a correction bumps the version: the old step goes stale then cancelled, a fresh one is pending', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'Shorter.' }))
+    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
+    await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+    const intentId = Object.keys((kv.room as RoomState).intents)[0]!
+    expect((kv.room as RoomState).steps[`${intentId}:1`]?.status).toBe('done')
+
+    await echo.handle(event(2, [node('updated', 'Actually make it shorter.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const room = kv.room as RoomState
+    expect(room.intents[intentId]?.version).toBe(2)
+    expect(room.steps[`${intentId}:1`]?.status).toBe('cancelled')
+    expect(room.steps[`${intentId}:2`]).toMatchObject({ status: 'done', intentVersion: 2 })
+  })
+
+  test('an ignored body change never gets a plan step', async () => {
+    const { kv, ctx } = harness({ llm: fakeLlm(() => ({ respond: false })), comments: fakeComments() })
+    await echo.handle(event(1, [node('updated', 'This is just a statement.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+    expect((kv.room as RoomState).steps).toEqual({})
+  })
+
+  test('a comment thread marks its step done, whether or not echo actually replies', async () => {
+    const spy = scriptedLlm(() => ({ respond: true, reply: 'Yes.' }))
+    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
+    await echo.handle(event(1, [commentChange()]), ctx)
+
+    const intentId = Object.keys((kv.room as RoomState).intents)[0]!
+    expect((kv.room as RoomState).steps[`${intentId}:1`]).toMatchObject({
+      status: 'done',
+      description: 'answer the question',
+    })
+  })
+
+  test('a comment echo declines to answer still settles its step as done, not stuck active', async () => {
+    const spy = scriptedLlm(() => ({ respond: false }))
+    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
+    await echo.handle(event(1, [commentChange({ body: 'Should I keep this?' })]), ctx)
+
+    const intentId = Object.keys((kv.room as RoomState).intents)[0]!
+    expect((kv.room as RoomState).steps[`${intentId}:1`]?.status).toBe('done')
+  })
+})

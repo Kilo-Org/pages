@@ -16,6 +16,8 @@ import {
   findActiveIntentForTarget,
   findIntentForThread,
   markCommentHandled,
+  markStepActive,
+  markStepDone,
   migrateNodes,
   noteSelection,
   recordBodyChange,
@@ -304,11 +306,12 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       )
       const intent = findActiveIntentForTarget(next, key)
       const target = next.targets[key]
+      const withFence =
+        intent && target
+          ? recordTarget(next, { ...target, assumedIntentVersion: intent.version })
+          : next
       return {
-        room:
-          intent && target
-            ? recordTarget(next, { ...target, assumedIntentVersion: intent.version })
-            : next,
+        room: intent ? markStepActive(withFence, intent.id) : withFence,
         value: intent?.id ?? null,
       }
     })
@@ -371,6 +374,7 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         lastReply,
       })
       if (intentId && threadId) nextRoom = attachThreadToIntent(nextRoom, intentId, threadId)
+      if (intentId) nextRoom = markStepDone(nextRoom, intentId)
       return { room: nextRoom, value: 'written' as const }
     })
     if (outcome === 'discarded') {
@@ -441,14 +445,16 @@ async function handleComment(
       at,
       true,
     )
-    return { room: next, value: findIntentForThread(next, change.threadId)?.id ?? null }
+    const intent = findIntentForThread(next, change.threadId)
+    return { room: intent ? markStepActive(next, intent.id) : next, value: intent?.id ?? null }
   })
 
   const markHandled = () =>
-    updateRoom(ctx, pageId, (room) => ({
-      room: markCommentHandled(room, change.threadId, handleKey),
-      value: undefined,
-    }))
+    updateRoom(ctx, pageId, (room) => {
+      let next = markCommentHandled(room, change.threadId, handleKey)
+      if (intentId) next = markStepDone(next, intentId)
+      return { room: next, value: undefined }
+    })
 
   if (triage.outcome === 'ignore') {
     await markHandled()
@@ -476,6 +482,7 @@ async function handleComment(
     })
     let next = markCommentHandled(room, change.threadId, handleKey)
     if (intentId) next = attachThreadToIntent(next, intentId, change.threadId)
+    if (intentId) next = markStepDone(next, intentId)
     return { room: next, value: 'posted' as const }
   })
   if (result === 'posted')
