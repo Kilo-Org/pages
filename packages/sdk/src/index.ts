@@ -133,6 +133,8 @@ export type PresenceCapability = {
 }
 
 export type ProgramContext = {
+  /** The page this instance is watching. */
+  pageId?: string
   log(message: string, data?: Record<string, unknown>): void
   state: ProgramState
   scratch: ScratchState
