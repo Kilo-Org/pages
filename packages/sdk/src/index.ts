@@ -105,6 +105,35 @@ export type ScratchState = {
 export type LlmCapability = {
   /** `signal`, if given, aborts the underlying request — for discarding stale speculative work. */
   complete(input: { system: string; prompt: string; signal?: AbortSignal }): Promise<string>
+  /**
+   * Optional tool-calling path. Hosts that do not implement it leave `undefined`; programs
+   * must fall back to a deterministic plan instead of failing.
+   */
+  completeWithTools?(input: {
+    system: string
+    prompt: string
+    tools: LlmTool[]
+    toolChoice?: 'auto' | 'required'
+    signal?: AbortSignal
+  }): Promise<LlmToolResponse>
+}
+
+/** A tool the model may call, in the OpenAI function-calling shape (without the wrapper). */
+export type LlmTool = {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+}
+
+export type LlmToolCall = {
+  id: string
+  name: string
+  arguments: unknown
+}
+
+export type LlmToolResponse = {
+  content: string | null
+  toolCalls: LlmToolCall[]
 }
 
 /** Comment writes. The host supplies the Pages client and credentials. */
@@ -121,6 +150,12 @@ export type CommentsCapability = {
     body: string
     dedupeOn: string
   }): Promise<{ threadId: string; messageId: string }>
+  /** Replies in an existing thread. Same idempotency approach. */
+  replyToThread(input: {
+    threadId: string
+    body: string
+    dedupeOn: string
+  }): Promise<{ threadId: string; messageId: string }>
 }
 
 /**
@@ -130,6 +165,28 @@ export type CommentsCapability = {
  */
 export type PresenceCapability = {
   showReading(blockId: string): Promise<void>
+}
+
+/**
+ * A UX hint only: publishes a short-lived "working on this" indicator, so a
+ * person sees the agent is busy before any reply is ready — not a
+ * correctness-bearing write. Works for browser-session credentials too, where
+ * the reading caret is suppressed. Safe to ignore on failure.
+ */
+export type ProgressCapability = {
+  /**
+   * Starts or renews a lease. Pass `progressId`/`leaseToken` from a previous
+   * report to renew instead of starting a second indicator.
+   */
+  report(input: {
+    message: string
+    blockId?: string
+    matchText?: string
+    progressId?: string
+    leaseToken?: string
+  }): Promise<{ progressId: string; leaseToken: string | null }>
+  /** Clears a lease. An expired lease is already gone, so this is safe to skip. */
+  clear(input: { progressId: string; leaseToken: string }): Promise<void>
 }
 
 export type ProgramContext = {
@@ -142,6 +199,7 @@ export type ProgramContext = {
   llm?: LlmCapability
   comments?: CommentsCapability
   presence?: PresenceCapability
+  progress?: ProgressCapability
 }
 
 export type Program = {

@@ -96,26 +96,88 @@ ledger plus the bookkeeping the executor needs.
 - `intents` — one per target, with a unique id, `kind`, `status`, `version`,
   `targetScope`, `outputKind`, `confidence`, and evidence. A new admission
   after an abandoned intent keeps the old entry.
-- `steps` — the container for planned work. This branch does not create steps
-  yet; a version bump leaves older steps `stale`, and `cancelStaleSteps` is
-  available for an executor that owns them.
+- `steps` — ordered work for one intent version: 1–30 steps with `kind`,
+  `position`, and `dependsOn`. `new_action` and `correction` get a plan;
+  `chat` and `clarify` do not. A version bump marks older steps `stale`;
+  they are cancelled only when unowned.
 - `targets` — per-node reply identity (`threadId`/`messageId`/`lastReply`),
   dedupe text, backoff, and the `generation` / `assumedIntentVersion` fence.
 - `selections` — the latest person selection per peer, with one evidence ref
   per peer in the intent.
 
-A body change creates the target's `action` intent on first sight and bumps
-its version on later change. The first reply attaches its thread to the
-intent. `attempt()` reads the model outside the room lock, then re-checks
-text, generation, and intent version immediately before writing. The lock
-covers the check and the write, not the model call, so one slow draft does
-not block other targets.
+Triage creates the target's intent (action, correction, chat, or clarify);
+a later change to an active target bumps its version. The first reply
+attaches its thread to the intent. `attempt()` reads the model outside the
+room lock, then re-checks text, generation, and intent version immediately
+before writing. The lock covers the check and the write, not the model call,
+so one slow draft does not block other targets.
 
 PR 3's flat `nodes/*` records are migrated once into `room.targets` on first
 read. While the room is introduced, changed target records are also written
 back to their `nodes/*` keys, so a rollback to PR 3 keeps reply identity for
 new writes. A deleted thread clears the target's reply identity so the next
 edit creates a new thread instead of retrying an edit against a deleted one.
+
+## Triaging before answering
+
+The assistant is always watching. Every settled, non-empty change is
+classified against the room, and none of them stays silent:
+
+| Signal | Outcome |
+| --- | --- |
+| explicit correction language, or an edit overlapping an active intent | `correction` |
+| a question | `chat` |
+| request language ("please", add/fix/change/shorten/…) | `new_action` |
+| hedged language ("maybe", "not sure", "should we") | ambiguous → one model classification call |
+| any other statement, thought, or plan fragment | ambiguous → one model classification call |
+
+`clarify` is the fallback when the classification model returns malformed
+output. A clear correction never calls the classification model; it goes
+straight to the answer generation call.
+
+Rules read a lightly normalized copy of the text, with markdown emphasis,
+code ticks, and leading escapes removed, so `**Does this work?**` is still
+recognized as a question. The body classifier receives the previous text and
+reply as context, and a body correction prompt carries the text the edit
+replaced (`previousText`), so "make it shorter" has something to shorten.
+If there is no previous text to work from, the model asks for it.
+
+Generation follows triage instead of deciding again. Every outcome must
+produce a reply or a short suggestion; there is no `respond: false` escape.
+A missing reply is a failed attempt and retries with backoff, not silence.
+`new_action` and `chat` answer, suggest, or ask one short clarifying
+question, and a `correction` with no earlier reply acts on the previous text
+or asks what to change. The only no-op is empty text.
+
+For `new_action` and `correction`, echo asks the model for an ordered plan
+through the `todo_write` tool, then the room validates and persists it.
+`task` steps are the user-facing deliverables; `draft_reply`, `post_reply`,
+and `edit_reply` are execution steps. A multi-part request should have one
+task per deliverable, which becomes a visible checklist. A single-deliverable
+request has no task steps, so it gets a normal reply.
+
+For a body action with task steps, echo posts an unchecked checklist before
+generation and edits the same message to the checked list plus the answer.
+For a comment action, the threaded reply includes the checked list. The list
+is not a separate page block: comments are the only visible write surface
+today. The answer returns `completedTasks` keys, so a partial reply checks
+only the tasks it finished and leaves the rest pending; `completed: false`
+keeps everything unchecked. Hosts without `completeWithTools` fall back to
+`draft → post` (or `draft → edit` for a body correction), which has no task
+steps and therefore no checklist. Chat never gets a plan, so a knowledge
+answer cannot become a hidden to-do item.
+
+A plan that names unsupported work, repeats keys, or has a cycle is rejected.
+`post_reply` and `edit_reply` are normalized to what the executor will do:
+edit when a reply already exists, post otherwise. Draft and final writes use
+different idempotency prefixes (`plan:` and `reply:`), so editing the
+checklist cannot collide with the final edit.
+
+A comment on an active thread is answered in that thread with
+`replyToThread`, not by creating a new block comment. The handled message
+body is recorded per thread, so a redelivered event cannot double-reply.
+A failed comment generation creates no intent and bumps no version; the
+retry starts clean and only records the intent when the reply succeeds.
 
 ## Replying to settled text, speculatively
 
@@ -200,3 +262,16 @@ up for API-credentialed hosts (an API key or MCP OAuth) — a host signed in
 the way a browser is (the local-dev default, no `PAGES_TOKEN`) publishes
 nothing, same as a person's own editor never shows their own caret back to
 them.
+
+Because that caret is invisible in local development, `attempt()` also
+publishes a working indicator through `report_page_progress`
+(`ctx.progress`, `packages/pages/src/progress.ts`). It is a short-lived lease,
+not page state: `Thinking about this paragraph…` when deciding, then
+`Planning this request…`, `Updating my reply…`, or `Working through N tasks…`
+once triage and the plan are known. The lease is renewed every 25 seconds for
+slow generations and cleared when the attempt commits, is aborted, or fails.
+An anchored report needs a scoped `read_page` for heads and a uniquely
+matching passage; if either is unavailable it falls back to a message-only
+indicator. Unlike the reading caret, this works for every credential kind,
+including a browser-session login, so it is the indicator local developers
+actually see.
