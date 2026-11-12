@@ -238,7 +238,7 @@ export function markCommentHandled(
   }
 }
 
-export type TriageApplication = { room: RoomState; intent?: Intent }
+export type TriageApplication = { room: RoomState; intent: Intent }
 
 /**
  * Applies a triage decision to the room. Body changes already bumped their
@@ -249,7 +249,7 @@ export function applyTriage(
   room: RoomState,
   input: {
     intentId: string | null
-    kind: IntentKind | null
+    kind: IntentKind
     targetScope: TargetScope
     confidence: number
     evidence: EvidenceRef
@@ -257,7 +257,6 @@ export function applyTriage(
   now: string,
   bump: boolean,
 ): TriageApplication {
-  if (input.kind === null) return { room }
   const intent =
     (input.intentId && room.intents[input.intentId]) ||
     (input.targetScope.threadId && findIntentForThread(room, input.targetScope.threadId)) ||
@@ -299,7 +298,7 @@ export function applyTriage(
       updatedAt: now,
     },
   })
-  return { room: updated, intent: updated.intents[intent.id] }
+  return { room: updated, intent: updated.intents[intent.id]! }
 }
 
 export function admitIntent(
@@ -571,7 +570,7 @@ export function recordBodyChange(
   const generation = (prior?.generation ?? 0) + 1
   const existing = findActiveIntentForTarget(room, target.key)
   // Triage decides whether this change is an action, correction, chat or
-  // ignore, and creates the intent. Here we only carry the fence forward.
+  // clarification, and creates the intent. Here we only carry the fence forward.
   if (!existing) {
     return recordTarget(room, {
       ...target,

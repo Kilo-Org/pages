@@ -8,6 +8,7 @@ import {
   TODO_WRITE_TOOL,
   triageBody,
   triageComment,
+  triagePrompt,
   TRIAGE_SYSTEM_PROMPT,
 } from './triage.ts'
 
@@ -53,9 +54,10 @@ describe('triageBody', () => {
     ['**Does this work?**', 'chat', null],
     ['\\\n**Can you fix this?**', 'chat', null],
     ['**No.**', 'correction', null],
-    ['still thinking out loud', 'ignore', null],
+    ['still thinking out loud', 'ambiguous', null],
     ['Maybe we should revise the intro.', 'ambiguous', null],
-    ['This section is fine.', 'ignore', null],
+    ['This section is fine.', 'ambiguous', null],
+    ['', 'ambiguous', null],
   ]
 
   for (const [text, expected, intentId] of cases) {
@@ -99,9 +101,6 @@ describe('triageComment', () => {
     )
   })
 
-  test('deleted threads are ignored', () => {
-    expect(outcome(triageComment(comment({ change: 'deleted' }), emptyRoom('p')))).toBe('ignore')
-  })
 
   test('a statement reply on an intent thread is a correction', () => {
     const admitted = admitIntent(
@@ -121,7 +120,7 @@ describe('triageComment', () => {
   })
 
   test('short comments and hedged requests', () => {
-    expect(outcome(triageComment(comment({ body: 'ok' }), emptyRoom('p')))).toBe('ignore')
+    expect(outcome(triageComment(comment({ body: 'ok' }), emptyRoom('p')))).toBe('ambiguous')
     expect(
       outcome(triageComment(comment({ body: 'Maybe we should rework the intro.' }), emptyRoom('p'))),
     ).toBe('ambiguous')
@@ -134,7 +133,6 @@ describe('kinds and parsing', () => {
     expect(kindFor('correction')).toBe('correction')
     expect(kindFor('chat')).toBe('chat')
     expect(kindFor('clarify')).toBe('clarify')
-    expect(kindFor('ignore')).toBeNull()
   })
 
   test('parseTriage accepts strict JSON and strips fences', () => {
@@ -149,10 +147,22 @@ describe('kinds and parsing', () => {
   test('parseTriage rejects malformed output', () => {
     expect(() => parseTriage('{oops')).toThrow()
     expect(() => parseTriage('{"outcome":"dance"}')).toThrow()
+    expect(() => parseTriage('{"outcome":"ignore"}')).toThrow()
+  })
+
+  test('the classifier receives previous text and reply', () => {
+    const prompt = JSON.parse(
+      triagePrompt('body', 'I need a trip', emptyRoom('p'), 'nodes/b1:0', 'old text', 'old reply'),
+    )
+    expect(prompt).toMatchObject({ previousText: 'old text', previousReply: 'old reply' })
+  })
+
+  test('the classification prompt does not include ignore', () => {
+    expect(TRIAGE_SYSTEM_PROMPT).not.toContain('ignore')
   })
 
   test('the classification prompt names every outcome', () => {
-    for (const word of ['new_action', 'correction', 'chat', 'clarify', 'ignore'])
+    for (const word of ['new_action', 'correction', 'chat', 'clarify'])
       expect(TRIAGE_SYSTEM_PROMPT).toContain(word)
   })
 })

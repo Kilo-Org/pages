@@ -15,7 +15,7 @@ import {
   type StepKind,
 } from './room.ts'
 
-export type TriageOutcome = 'new_action' | 'correction' | 'chat' | 'clarify' | 'ignore'
+export type TriageOutcome = 'new_action' | 'correction' | 'chat' | 'clarify'
 
 export type Triage = {
   outcome: TriageOutcome
@@ -34,8 +34,6 @@ const REQUEST =
 const CORRECTION =
   /\b(actually|instead|not|no|wrong|rather|i meant|should be|change that|make that|that's not)\b/i
 const HEDGE = /\b(maybe|perhaps|consider|might|should we|could we|i wonder|not sure|possibly)\b/i
-
-const MIN_CHARS = 3
 
 /** Strip the markdown wrappers that hide a question or request from the rules. */
 const signalText = (text: string) =>
@@ -66,21 +64,20 @@ export function triageBody(
   targetKey: string,
 ): Triage | Ambiguous {
   const trimmed = signalText(text)
-  if (trimmed.length < MIN_CHARS) return decision('ignore', undefined, 0.9, 'too short')
+  if (!trimmed) return { ambiguous: true, signals: ['empty text'] }
   const intent = findActiveIntentForTarget(room, targetKey)
   if (CORRECTION.test(trimmed)) return decision('correction', intent, 0.85, 'correction language')
   if (QUESTION.test(trimmed)) return decision('chat', intent, 0.8, 'question')
   if (REQUEST.test(trimmed)) return decision('new_action', intent, 0.75, 'request language')
   if (HEDGE.test(trimmed)) return { ambiguous: true, signals: ['hedged request'] }
   if (intent) return decision('correction', intent, 0.6, 'overlaps an active intent')
-  return decision('ignore', undefined, 0.6, 'statement, not addressed to an agent')
+  return { ambiguous: true, signals: ['statement'] }
 }
 
 /** A comment or reply. A thread tied to an intent is the strongest signal. */
 export function triageComment(change: CommentChange, room: RoomState): Triage | Ambiguous {
-  if (change.change === 'deleted') return decision('ignore', undefined, 1, 'thread deleted')
   const text = signalText(change.body ?? '')
-  if (text.length < MIN_CHARS) return decision('ignore', undefined, 0.9, 'too short')
+  if (!text) return { ambiguous: true, signals: ['empty text'] }
   const intent =
     findIntentForThread(room, change.threadId) ??
     (change.blockId ? findIntentForBlock(room, change.blockId) : undefined)
@@ -89,22 +86,23 @@ export function triageComment(change: CommentChange, room: RoomState): Triage | 
   if (REQUEST.test(text)) return decision('new_action', intent, 0.75, 'request language')
   if (HEDGE.test(text)) return { ambiguous: true, signals: ['hedged request'] }
   if (intent) return decision('correction', intent, 0.6, 'reply on an active intent')
-  return decision('ignore', undefined, 0.6, 'statement, not addressed to an agent')
+  return { ambiguous: true, signals: ['statement'] }
 }
 
-export function kindFor(outcome: TriageOutcome): IntentKind | null {
+export function kindFor(outcome: TriageOutcome): IntentKind {
   if (outcome === 'new_action') return 'action'
   if (outcome === 'correction') return 'correction'
   if (outcome === 'chat') return 'chat'
-  if (outcome === 'clarify') return 'clarify'
-  return null
+  return 'clarify'
 }
 
 export const TRIAGE_SYSTEM_PROMPT = [
-  'Classify one user change on a collaborative page for an assistant.',
-  'Outcomes: new_action (a new request), correction (a change to work already underway),',
-  'chat (a question or conversational turn worth answering), clarify (intent is unclear),',
-  'ignore (not addressed to the assistant).',
+  'Classify one user change on a collaborative page for an always-watching assistant.',
+  'Every change is addressed to the assistant; infer the need, thought, or plan behind it.',
+  'Outcomes: new_action (a request or plan to act on), correction (a change to work already underway),',
+  'chat (an observation, question, or thought worth answering or suggesting from),',
+  'clarify (genuinely impossible to interpret without a question).',
+  'Prefer chat or new_action when a need is inferable; never stay silent.',
   'Return strict JSON only, no prose, no code fences:',
   '{"outcome": string, "intentId": string or null, "confidence": number from 0 to 1, "reason": string}.',
 ].join(' ')
@@ -192,6 +190,8 @@ export function triagePrompt(
   text: string,
   room: RoomState,
   targetKey: string | null,
+  previousText: string | null = null,
+  previousReply: string | null = null,
 ): string {
   const active = Object.values(room.intents)
     .filter((intent) => intent.status === 'active')
@@ -202,7 +202,7 @@ export function triagePrompt(
       scope: intent.targetScope,
       version: intent.version,
     }))
-  return JSON.stringify({ surface, text, targetKey, activeIntents: active })
+  return JSON.stringify({ surface, text, targetKey, previousText, previousReply, activeIntents: active })
 }
 
 export function parseTriage(raw: string): Triage {
@@ -220,7 +220,7 @@ export function parseTriage(raw: string): Triage {
     confidence?: unknown
     reason?: unknown
   }
-  if (!['new_action', 'correction', 'chat', 'clarify', 'ignore'].includes(String(outcome)))
+  if (!['new_action', 'correction', 'chat', 'clarify'].includes(String(outcome)))
     throw new Error(`malformed triage outcome: ${String(outcome)}`)
   return {
     outcome: outcome as TriageOutcome,

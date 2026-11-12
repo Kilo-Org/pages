@@ -97,8 +97,8 @@ ledger plus the bookkeeping the executor needs.
   `targetScope`, `outputKind`, `confidence`, and evidence.
 - `steps` — ordered work for one intent version: 1–30 steps with `kind`,
   `position`, and `dependsOn`. `new_action` and `correction` get a plan;
-  `chat`, `clarify`, and `ignore` do not. A version bump marks older steps
-  `stale`; they are cancelled only when unowned.
+  `chat` and `clarify` do not. A version bump marks older steps `stale`;
+  they are cancelled only when unowned.
 - `targets` — per-node reply identity (`threadId`/`messageId`/`lastReply`),
   dedupe text, backoff, and the `generation` / `assumedIntentVersion` fence.
 - `selections` — the latest person selection per peer, used as scope evidence.
@@ -114,8 +114,8 @@ read. The old keys stay in place so a rollback still has reply identity.
 
 ## Triaging before answering
 
-Every user change is classified against the room before echo decides to
-answer:
+The assistant is always watching. Every settled, non-empty change is
+classified against the room, and none of them stays silent:
 
 | Signal | Outcome |
 | --- | --- |
@@ -123,7 +123,7 @@ answer:
 | a question | `chat` |
 | request language ("please", add/fix/change/shorten/…) | `new_action` |
 | hedged language ("maybe", "not sure", "should we") | ambiguous → one model classification call |
-| a statement not addressed to an agent | `ignore` |
+| any other statement, thought, or plan fragment | ambiguous → one model classification call |
 
 `clarify` is the fallback when the classification model returns malformed
 output. A clear correction never calls the classification model; it goes
@@ -131,15 +131,17 @@ straight to the answer generation call.
 
 Rules read a lightly normalized copy of the text, with markdown emphasis,
 code ticks, and leading escapes removed, so `**Does this work?**` is still
-recognized as a question. A body correction prompt also carries the text the
-edit replaced (`previousText`), so "make it shorter" has something to
-shorten. If there is no previous text to work from, the model asks for it.
+recognized as a question. The body classifier receives the previous text and
+reply as context, and a body correction prompt carries the text the edit
+replaced (`previousText`), so "make it shorter" has something to shorten.
+If there is no previous text to work from, the model asks for it.
 
-Generation follows triage instead of deciding again. `new_action` and `chat`
-must answer or ask one short clarifying question, and a `correction` with no
-earlier reply must act on the previous text or ask what to change. If the
-model declines one of those outcomes anyway, echo logs `declined …: triage
-<outcome>` instead of treating silence as a successful evaluation.
+Generation follows triage instead of deciding again. Every outcome must
+produce a reply or a short suggestion; there is no `respond: false` escape.
+A missing reply is a failed attempt and retries with backoff, not silence.
+`new_action` and `chat` answer, suggest, or ask one short clarifying
+question, and a `correction` with no earlier reply acts on the previous text
+or asks what to change. The only no-op is empty text.
 
 For `new_action` and `correction`, echo asks the model for an ordered plan
 through the `todo_write` tool, then the room validates and persists it.

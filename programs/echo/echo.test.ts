@@ -433,30 +433,32 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     expect(comments.posts).toHaveLength(2)
   })
 
-  test('skips text below the length gate — never asks the model', async () => {
+  test('skips empty text — never asks the model', async () => {
     const d = deferredLlm()
     const { kv, ctx } = harness({ llm: d.llm, comments: fakeComments() })
-    await echo.handle(event(1, [node('updated', 'ok')]), ctx)
+    await echo.handle(event(1, [node('updated', '   ')]), ctx)
     backdate(kv, 'nodes/b1:0', SPECULATIVE_PAUSE_MS + 500)
     await echo.tick!(ctx)
     await flush()
     expect(d.calls).toBe(0)
   })
 
-  test('a decline is recorded as evaluated (not re-asked), and nothing posts', async () => {
+  test('a statement reaches the classifier and gets a reply', async () => {
     const comments = fakeComments()
-    const llm = fakeLlm(() => ({ respond: false }))
-    const { kv, ctx } = harness({ llm, comments })
+    const spy = scriptedLlm((system) =>
+      system === TRIAGE_SYSTEM_PROMPT
+        ? { outcome: 'chat', confidence: 0.8, reason: 'statement' }
+        : { reply: 'Noted. I can help with that.' },
+    )
+    const { kv, ctx } = harness({ llm: spy.llm, comments })
     await echo.handle(event(1, [node('updated', 'Just a statement.')]), ctx)
     backdate(kv, 'nodes/b1:0', SPECULATIVE_PAUSE_MS + 500)
     await echo.tick!(ctx)
     await flush()
-    expect(comments.posts).toEqual([])
+    expect(comments.posts).toEqual([
+      { blockId: 'b1', body: 'Noted. I can help with that.', dedupeOn: 'Just a statement.' },
+    ])
     expect(targetOf(kv)?.evaluatedText).toBe('Just a statement.')
-
-    await echo.tick!(ctx)
-    await flush()
-    expect(comments.posts).toEqual([]) // still nothing — not re-asked
   })
 
   test('does nothing when llm/comments capabilities are not configured', async () => {
@@ -627,10 +629,10 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     expect(saved).toMatchObject({ lastReply: 'Yes, definitely.', threadId: 'thread-1', messageId: 'message-1' })
   })
 
-  test('a follow-up deciding not to update leaves the existing reply untouched', async () => {
+  test('a follow-up still responds when the existing reply stands', async () => {
     const comments = fakeComments()
-    const llm = fakeLlm(() => ({ respond: false }))
-    const { ctx } = harness({ llm, comments })
+    const spy = scriptedLlm(() => ({ reply: 'The existing answer still stands.' }))
+    const { ctx } = harness({ llm: spy.llm, comments })
     const base = record({
       text: 'Does it really work? Yes I think so.',
       threadId: 'thread-1',
@@ -640,9 +642,21 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     await ctx.state.set('nodes/b1:0', base)
     await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
     expect(comments.posts).toEqual([])
-    expect(comments.edits).toEqual([])
+    expect(comments.edits).toEqual([
+      {
+        threadId: 'thread-1',
+        messageId: 'message-1',
+        body: 'The existing answer still stands.',
+        dedupeOn: 'reply:The existing answer still stands.',
+      },
+    ])
     const saved = await savedTarget(ctx)
-    expect(saved).toMatchObject({ threadId: 'thread-1', messageId: 'message-1', lastReply: 'Yes, this works.', evaluatedText: base.text })
+    expect(saved).toMatchObject({
+      threadId: 'thread-1',
+      messageId: 'message-1',
+      lastReply: 'The existing answer still stands.',
+      evaluatedText: base.text,
+    })
   })
 
   test('a genuine failure on the edit path backs off the same way as on the add path', async () => {
@@ -802,7 +816,7 @@ describe('triage wiring', () => {
     const change = commentChange()
 
     await echo.handle(event(1, [change]), ctx)
-    expect(spy.calls[0]?.system).toContain('do not stay silent')
+    expect(spy.calls[0]?.system).toContain('always respond')
     expect(comments.replies).toEqual([
       {
         threadId: 't1',
@@ -944,12 +958,32 @@ describe('plan steps — the to-do list behind an intent', () => {
     })
   })
 
-  test('an ignored body change never gets a plan step', async () => {
-    const { kv, ctx } = harness({ llm: fakeLlm(() => ({ respond: false })), comments: fakeComments() })
+  test('a statement is classified instead of ignored and gets no plan', async () => {
+    const spy = scriptedLlm((system) =>
+      system === TRIAGE_SYSTEM_PROMPT
+        ? { outcome: 'chat', confidence: 0.8, reason: 'statement' }
+        : { reply: 'Noted.' },
+    )
+    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
     await echo.handle(event(1, [node('updated', 'This is just a statement.')]), ctx)
     await echo.tick!(ctx)
     await flush()
     expect((kv.room as RoomState).steps).toEqual({})
+  })
+
+  test('deleting a comment thread closes its intent without a reply', async () => {
+    const spy = scriptedLlm(() => ({ reply: 'Summary added.' }))
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm: spy.llm, comments })
+    await echo.handle(event(1, [commentChange({ body: 'Please add a summary.' })]), ctx)
+    expect(comments.replies).toHaveLength(1)
+
+    await echo.handle(event(2, [commentChange({ change: 'deleted' })]), ctx)
+
+    const room = kv.room as RoomState
+    const intent = Object.values(room.intents)[0]!
+    expect(intent.status).toBe('abandoned')
+    expect(comments.replies).toHaveLength(1)
   })
 
   test('a chat comment gets no plan, whether or not echo replies', async () => {
@@ -959,17 +993,19 @@ describe('plan steps — the to-do list behind an intent', () => {
     expect((kv.room as RoomState).steps).toEqual({})
   })
 
-  test('a declined action comment cancels its plan', async () => {
-    const spy = scriptedLlm(() => ({ respond: false }))
-    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
+  test('an action comment always posts its reply and completes the plan', async () => {
+    const spy = scriptedLlm(() => ({ reply: 'Summary added.' }))
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm: spy.llm, comments })
     await echo.handle(event(1, [commentChange({ body: 'Please add a summary.' })]), ctx)
 
+    expect(comments.replies).toHaveLength(1)
     const room = kv.room as RoomState
     const intentId = Object.keys(room.intents)[0]!
     expect(room.intents[intentId]?.kind).toBe('action')
     const steps = Object.values(room.steps).filter((step) => step.intentId === intentId)
     expect(steps).toHaveLength(2)
-    expect(steps.every((step) => step.status === 'cancelled')).toBe(true)
+    expect(steps.every((step) => step.status === 'done')).toBe(true)
   })
 
   test('todo_write proposes the plan when the host supports tools', async () => {
