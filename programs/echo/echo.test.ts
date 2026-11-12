@@ -8,16 +8,26 @@ import type {
   LlmCapability,
   PageChange,
   PageChangedEvent,
+  PageRead,
   PresenceCapability,
   ProgramContext,
+  ReadsCapability,
+  ThreadRead,
 } from '@pages-programs/sdk'
 
-function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability; presence?: PresenceCapability }) {
+function harness(extra?: {
+  llm?: LlmCapability
+  comments?: CommentsCapability
+  presence?: PresenceCapability
+  reads?: ReadsCapability
+  ownPrincipal?: string
+}) {
   const lines: string[] = []
   const kv: Record<string, unknown> = {}
   const scratch = new Map<string, unknown>()
   const ctx: ProgramContext = {
     pageId: 'p',
+    ownPrincipal: extra?.ownPrincipal,
     log: (message) => void lines.push(message),
     state: {
       get: async <T>(key: string) => kv[key] as T | undefined,
@@ -33,6 +43,7 @@ function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability; p
     llm: extra?.llm,
     comments: extra?.comments,
     presence: extra?.presence,
+    reads: extra?.reads,
   }
   return { lines, kv, scratch, ctx }
 }
@@ -119,6 +130,157 @@ function fakeComments(): CommentsCapability & {
       return { threadId: input.threadId, messageId: `reply-${replies.length}` }
     },
   }
+}
+
+/** The model prompt starts with a trust line, then the JSON envelope. */
+const envelopeOf = (prompt: string | undefined) => {
+  if (!prompt) throw new Error('no prompt was recorded')
+  const start = prompt.indexOf('{')
+  return JSON.parse(prompt.slice(start)) as {
+    task: {
+      purpose: string
+      surface: string
+      instruction: string
+      intent: { kind: string | null; version: number | null; step: unknown }
+      previousReply: string | null
+      plan?: { key: string; description: string; status: string }[]
+    }
+    context: {
+      trigger: {
+        text: string
+        previousText: string | null
+        threadId: string | null
+        blockId: string | null
+      }
+      page: {
+        title: string | null
+        block: { headingPath: string[]; markdown: string | null; type: string | null } | null
+        outline: { heading: string; level: number; blockId: string }[]
+      }
+      thread: {
+        id: string
+        messages: { author: string; body: string }[]
+      } | null
+      openThreads: { id: string; messages: { author: string; body: string }[] }[]
+      timeline: { hot: { summary: string }[]; warm: string | null } | null
+      presence: unknown[]
+    }
+  }
+}
+
+const pageRead = (overrides: Partial<PageRead> = {}): PageRead => ({
+  title: 'Q4 plan',
+  heads: ['h1'],
+  commentHeads: ['c1'],
+  blocks: [
+    {
+      id: 'b1',
+      markdown: 'Please tighten the budget paragraph but keep the two examples.',
+    },
+  ],
+  outline: [
+    {
+      blockId: 'b1',
+      nodeIndex: 0,
+      nodeId: null,
+      type: 'paragraph',
+      headingPath: ['Q4 plan', 'Budget'],
+      heading: 'Budget',
+      level: 2,
+      markdownBytes: 58,
+    },
+  ],
+  presence: [
+    {
+      peerId: 'peer-other',
+      principal: 'person-1',
+      displayName: 'Sam',
+      driver: 'Browser',
+      lastSeen: new Date().toISOString(),
+      selection: {
+        blockId: 'b1',
+        status: 'attached',
+        kind: 'selection',
+        startUtf16: 0,
+        endUtf16: 6,
+        quote: 'budget',
+      },
+    },
+    {
+      peerId: 'peer-self',
+      principal: 'self',
+      displayName: 'Echo',
+      driver: 'agent',
+      lastSeen: new Date().toISOString(),
+      selection: {
+        blockId: 'b1',
+        status: 'attached',
+        kind: 'caret',
+        startUtf16: 0,
+        endUtf16: 0,
+        quote: null,
+      },
+    },
+  ],
+  ...overrides,
+})
+
+const threadRead = (overrides: Partial<ThreadRead> = {}): ThreadRead => ({
+  id: 't1',
+  state: 'open',
+  blockId: 'b1',
+  selection: { text: 'the two examples' },
+  messageCount: 2,
+  messages: [
+    {
+      id: 'm0',
+      body: 'Should we keep the examples?',
+      author: {
+        principal: 'person-1',
+        displayName: 'Sam',
+        driver: 'Browser',
+        agent: null,
+      },
+      createdAt: '2026-11-12T21:58:00.000Z',
+      deletedAt: null,
+      isSelf: false,
+    },
+    {
+      id: 'm1',
+      body: 'Yes, keep both.',
+      author: {
+        principal: 'self',
+        displayName: 'Echo',
+        driver: 'agent',
+        agent: { name: 'echo', model: 'test' },
+      },
+      createdAt: '2026-11-12T21:59:00.000Z',
+      deletedAt: null,
+      isSelf: true,
+    },
+  ],
+  ...overrides,
+})
+
+function fakeReads(options: {
+  page?: PageRead
+  threads?: ThreadRead[]
+  fail?: boolean
+} = {}) {
+  const counters = { page: 0, comments: 0 }
+  const reads: ReadsCapability = {
+    page: async () => {
+      counters.page++
+      if (options.fail) throw new Error('read unavailable')
+      return options.page ?? pageRead()
+    },
+    comments: async () => {
+      counters.comments++
+      if (options.fail) throw new Error('read unavailable')
+      return options.threads ?? [threadRead()]
+    },
+  }
+  return { reads, counters }
 }
 
 const node = (change: BodyChange['change'], markdown: string | null): BodyChange => ({
@@ -325,7 +487,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     await echo.tick!(ctx)
     await flush()
     expect(d.calls).toBe(1)
-    expect(d.promptSeen).toBe('please tighten this paragraph')
+    expect(envelopeOf(d.promptSeen).context.trigger.text).toBe('please tighten this paragraph')
   })
 
   test('skips the pause entirely for text that already looks sentence-complete', async () => {
@@ -335,7 +497,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     await echo.tick!(ctx) // no backdate — this is the whole point
     await flush()
     expect(d.calls).toBe(1)
-    expect(d.promptSeen).toBe('Does it work?')
+    expect(envelopeOf(d.promptSeen).context.trigger.text).toBe('Does it work?')
   })
 
   test('commits immediately once a matching draft resolves — no further wait', async () => {
@@ -801,10 +963,12 @@ describe('triage wiring', () => {
     await echo.tick!(ctx)
     await flush()
 
-    expect(spy.calls[0]?.prompt).toContain(
-      'Previous text: "Please tighten this paragraph."',
+    expect(envelopeOf(spy.calls[0]?.prompt).context.trigger.previousText).toBe(
+      'Please tighten this paragraph.',
     )
-    expect(spy.calls[0]?.prompt).toContain('Current text: "Actually, make it shorter."')
+    expect(envelopeOf(spy.calls[0]?.prompt).context.trigger.text).toBe(
+      'Actually, make it shorter.',
+    )
     expect(comments.posts).toEqual([
       { blockId: 'b1', body: 'Shorter.', dedupeOn: 'Actually, make it shorter.' },
     ])
@@ -1518,5 +1682,122 @@ describe('failure fencing and thread lifecycle', () => {
     expect(room.pageId).toBe('p')
     expect(room.targets['nodes/b1:0']?.pageId).toBe('p')
     expect(comments.posts).toHaveLength(1)
+  })
+})
+
+describe('context assembly in echo', () => {
+  test('body generation gets the page locality, presence, and open thread history', async () => {
+    const reads = fakeReads({ page: pageRead(), threads: [threadRead()] })
+    const spy = scriptedLlm(() => ({ reply: 'Tightened, with both examples.' }))
+    const comments = fakeComments()
+    const { kv, ctx } = harness({
+      llm: spy.llm,
+      comments,
+      reads: reads.reads,
+      ownPrincipal: 'self',
+    })
+
+    await echo.handle(
+      event(1, [node('updated', 'Please tighten the budget paragraph but keep the two examples.')]),
+      ctx,
+    )
+    await echo.tick!(ctx)
+    await flush()
+
+    const generation = spy.calls.at(-1)!
+    expect(generation.system).toContain('untrusted page content')
+    expect(generation.prompt).toContain('untrusted page content')
+    const envelope = envelopeOf(generation.prompt)
+    expect(envelope.context.page.title).toBe('Q4 plan')
+    expect(envelope.context.page.block).toMatchObject({
+      headingPath: ['Q4 plan', 'Budget'],
+      type: 'paragraph',
+    })
+    expect(envelope.context.page.block?.markdown).toContain('keep the two examples')
+    expect(envelope.context.openThreads[0]?.messages.map((message) => message.author)).toEqual([
+      'Sam',
+      'you',
+    ])
+    expect(envelope.context.presence).toHaveLength(1)
+    expect(reads.counters.page).toBe(1)
+    expect(reads.counters.comments).toBe(1)
+    expect(comments.posts).toHaveLength(1)
+  })
+
+  test('comment generation gets the trigger thread and echo own reply', async () => {
+    const reads = fakeReads({ page: pageRead(), threads: [threadRead()] })
+    const spy = scriptedLlm(() => ({ reply: 'Yes, keep both and tighten the rest.' }))
+    const comments = fakeComments()
+    const { ctx } = harness({
+      llm: spy.llm,
+      comments,
+      reads: reads.reads,
+      ownPrincipal: 'self',
+    })
+
+    await echo.handle(event(1, [commentChange()]), ctx)
+
+    const envelope = envelopeOf(spy.calls.at(-1)?.prompt)
+    expect(envelope.context.thread?.id).toBe('t1')
+    expect(envelope.context.thread?.messages.map((message) => message.author)).toEqual([
+      'Sam',
+      'you',
+    ])
+    expect(envelope.context.thread?.messages[1]?.body).toBe('Yes, keep both.')
+    expect(comments.replies).toHaveLength(1)
+    expect(reads.counters.page).toBe(1)
+    expect(reads.counters.comments).toBe(1)
+  })
+
+  test('a read failure degrades the prompt but still answers', async () => {
+    const reads = fakeReads({ fail: true })
+    const spy = scriptedLlm(() => ({ reply: 'Yes.' }))
+    const comments = fakeComments()
+    const { ctx, lines } = harness({
+      llm: spy.llm,
+      comments,
+      reads: reads.reads,
+      ownPrincipal: 'self',
+    })
+
+    await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const envelope = envelopeOf(spy.calls.at(-1)?.prompt)
+    expect(envelope.context.page.block).toBeNull()
+    expect(envelope.context.trigger.text).toBe('Does it work?')
+    expect(comments.posts).toHaveLength(1)
+    expect(lines.some((line) => line.includes('context reads degraded'))).toBe(true)
+    expect(lines.some((line) => line.includes('degraded=true'))).toBe(true)
+  })
+
+  test('timeline records the edit, triage, attempt, and reply exactly once', async () => {
+    const spy = scriptedLlm(() => ({ reply: 'Yes.' }))
+    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
+
+    await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const timeline = (kv.room as RoomState).timeline ?? []
+    const kinds = timeline.map((entry) => entry.kind)
+    expect(kinds.filter((kind) => kind === 'user_edit')).toHaveLength(1)
+    expect(kinds.filter((kind) => kind === 'triage')).toHaveLength(1)
+    expect(kinds.filter((kind) => kind === 'attempt_started')).toHaveLength(1)
+    expect(kinds.filter((kind) => kind === 'reply_written')).toHaveLength(1)
+    expect(timeline.find((entry) => entry.kind === 'reply_written')?.summary).toContain('Yes.')
+  })
+
+  test('a comment reply records the thread decision in the timeline', async () => {
+    const spy = scriptedLlm(() => ({ reply: 'Yes, that is the idea.' }))
+    const { kv, ctx } = harness({ llm: spy.llm, comments: fakeComments() })
+
+    await echo.handle(event(1, [commentChange()]), ctx)
+
+    const timeline = (kv.room as RoomState).timeline ?? []
+    expect(timeline.some((entry) => entry.kind === 'user_comment')).toBe(true)
+    expect(timeline.some((entry) => entry.kind === 'triage')).toBe(true)
+    expect(timeline.some((entry) => entry.kind === 'reply_written')).toBe(true)
   })
 })

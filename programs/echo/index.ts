@@ -15,6 +15,7 @@ import {
   commitIsCurrent,
   completePlan,
   emptyRoom,
+  findActiveIntentForTarget,
   forgetThread,
   markCommentHandled,
   migrateNodes,
@@ -33,6 +34,23 @@ import {
   type TargetState,
 } from './room.ts'
 import {
+  appendTimeline,
+  attemptEntry,
+  failureEntry,
+  intentVersionEntry,
+  replyEntry,
+  triageEntry,
+  userCommentEntry,
+  userEditEntry,
+} from './archivist.ts'
+import {
+  assembleContext,
+  describeContext,
+  renderPrompt,
+  type TriggerContext,
+} from './context.ts'
+import { gatherContext } from './gather.ts'
+import {
   kindFor,
   parseTodoWriteCall,
   parseTriage,
@@ -40,8 +58,8 @@ import {
   TODO_WRITE_TOOL,
   triageBody,
   triageComment,
-  triagePrompt,
   TRIAGE_SYSTEM_PROMPT,
+  CONTEXT_TRUST_RULE,
   type Ambiguous,
   type Triage,
 } from './triage.ts'
@@ -97,6 +115,7 @@ function normalizeRoom(room: RoomState, pageId = ''): RoomState {
     targets: room.targets ?? {},
     selections: room.selections ?? {},
     handledComments: room.handledComments ?? {},
+    timeline: room.timeline ?? [],
   }
 }
 
@@ -178,39 +197,41 @@ function withText(
   }
 }
 
-const ANSWER_SYSTEM_PROMPT = [
+const systemPrompt = (lines: string[]) => [...lines, CONTEXT_TRUST_RULE].join(' ')
+
+const ANSWER_SYSTEM_PROMPT = systemPrompt([
   'You are answering a question or request on a collaborative page.',
   'The assistant is always watching; infer the need or plan and always respond.',
   'Answer directly in 1-3 sentences, or make a short suggestion. If it is too vague, ask one short clarifying question.',
   'Set "completed" false when you are asking for missing context or could not finish the request; otherwise true.',
   'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
   'Respond with strict JSON only, no prose, no code fences: {"reply": string, "completed": boolean, "completedTasks": string[]}.',
-].join(' ')
+])
 
-const COMMENT_SYSTEM_PROMPT = [
+const COMMENT_SYSTEM_PROMPT = systemPrompt([
   'You are answering a message in one comment thread on a collaborative page.',
   'The assistant is always watching; infer the need or plan and always respond.',
   'Answer it, make a short suggestion, or ask one short clarifying question if it is too vague.',
   'Set "completed" false when you are asking for missing context or could not finish the request; otherwise true.',
   'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
   'Respond with strict JSON only, no prose, no code fences: {"reply": string, "completed": boolean, "completedTasks": string[]}.',
-].join(' ')
+])
 
-const CORRECTION_SYSTEM_PROMPT = [
+const CORRECTION_SYSTEM_PROMPT = systemPrompt([
   'You are handling a correction to text on a collaborative page.',
   'Use the previous text and the correction to work out what should change.',
   'Always respond: update the reply, acknowledge what still stands, or ask one short specific question.',
   'Set "completed" false when you are asking for missing context or could not finish the change; otherwise true.',
   'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
   'Respond with strict JSON only, no prose, no code fences: {"reply": string, "completed": boolean, "completedTasks": string[]}.',
-].join(' ')
+])
 
-const CLARIFY_SYSTEM_PROMPT = [
+const CLARIFY_SYSTEM_PROMPT = systemPrompt([
   'The request on this page is ambiguous. Ask one short, specific clarifying question.',
   'Respond with strict JSON only, no prose, no code fences: {"reply": string}.',
-].join(' ')
+])
 
-const FOLLOWUP_SYSTEM_PROMPT = [
+const FOLLOWUP_SYSTEM_PROMPT = systemPrompt([
   'You watch one block of text on a collaborative page. You already replied to it once; the text has changed since.',
   'The change may be a correction, a refinement, unrelated new content, or a new thought to build on.',
   'Always respond. If you update it, write the FULL replacement reply text: it wholly replaces your previous reply, it does not append to it.',
@@ -218,7 +239,7 @@ const FOLLOWUP_SYSTEM_PROMPT = [
   'Set "completed" false when you are asking for missing context or could not finish the change; otherwise true.',
   'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
   'Respond with strict JSON only, no prose, no code fences: {"reply": string, "completed": boolean, "completedTasks": string[]}.',
-].join(' ')
+])
 
 type Decision = { reply: string; completed?: boolean; completedTasks?: string[] }
 
@@ -260,13 +281,35 @@ async function resolveTriage(
   targetKey: string | null,
   signal?: AbortSignal,
   previousText: string | null = null,
-  previousReply: string | null = null,
 ): Promise<Triage> {
   if (!('ambiguous' in verdict)) return verdict
   try {
+    const assembled = assembleContext({
+      purpose: 'triage',
+      trigger: {
+        surface,
+        change: 'updated',
+        text,
+        previousText,
+        threadId: null,
+        blockId: null,
+        messageId: null,
+        author: null,
+      },
+      room,
+      target: targetKey ? room.targets[targetKey] ?? null : null,
+      intent: targetKey ? findActiveIntentForTarget(room, targetKey) ?? null : null,
+      steps: [],
+      page: null,
+      threads: [],
+      presence: [],
+      now: new Date().toISOString(),
+      budgetBytes: 8 * 1024,
+    })
+    ctx.log(`context triage ${surface} ${describeContext(assembled)}`)
     const raw = await ctx.llm!.complete({
       system: TRIAGE_SYSTEM_PROMPT,
-      prompt: triagePrompt(surface, text, room, targetKey, previousText, previousReply),
+      prompt: renderPrompt(assembled),
       ...(signal ? { signal } : {}),
     })
     return parseTriage(raw)
@@ -481,11 +524,33 @@ async function describe(
     abortSpeculative(ctx, key)
     await updateRoom(ctx, pageId, (room) => {
       const prior = room.targets[key]
+      const priorIntent = findActiveIntentForTarget(room, key)
       const target = withText(prior, pageId, change, after)
-      return {
-        room: recordBodyChange(room, target, { eventId, at }, at),
-        value: undefined,
+      const delta = textDelta(prior?.text ?? '', after)
+      let next = recordBodyChange(room, target, { eventId, at }, at)
+      next = appendTimeline(
+        next,
+        userEditEntry({
+          eventId,
+          at,
+          target,
+          before: prior?.text ?? null,
+          added: delta.added,
+          removed: delta.removed,
+        }),
+      )
+      const currentIntent = findActiveIntentForTarget(next, key)
+      if (priorIntent && currentIntent && currentIntent.version > priorIntent.version) {
+        next = appendTimeline(
+          next,
+          intentVersionEntry({
+            at,
+            intent: currentIntent,
+            previousVersion: priorIntent.version,
+          }),
+        )
       }
+      return { room: next, value: undefined }
     })
   }
   // Nothing to diff against until the program has seen this node once.
@@ -532,7 +597,6 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       key,
       signal,
       base.previousText,
-      base.lastReply,
     )
     ctx.log(`triage ${base.blockId.slice(0, 8)}: ${triage.outcome} (${triage.source}) ${triage.reason}`)
     const now = new Date().toISOString()
@@ -555,13 +619,35 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         intent && target
           ? recordTarget(result.room, { ...target, assumedIntentVersion: intent.version })
           : result.room
+      let nextRoom = appendTimeline(
+        withFence,
+        triageEntry({
+          eventId: `${key}:${base.generation}:triage`,
+          at: now,
+          surface: 'body',
+          scope: { blockId: base.blockId, nodeKey: key },
+          triage,
+        }),
+      )
+      nextRoom = appendTimeline(
+        nextRoom,
+        attemptEntry({
+          at: now,
+          key,
+          blockId: base.blockId,
+          generation: base.generation,
+          intentId: intent?.id ?? null,
+          intentVersion: intent?.version ?? null,
+          kind: 'attempt_started',
+        }),
+      )
       return {
-        room: withFence,
+        room: nextRoom,
         value: {
           intent,
-          steps: intent ? stepsForVersion(withFence, intent.id, intent.version) : [],
+          steps: intent ? stepsForVersion(nextRoom, intent.id, intent.version) : [],
           priorSteps: intent
-            ? stepsForVersion(withFence, intent.id, intent.version - 1)
+            ? stepsForVersion(nextRoom, intent.id, intent.version - 1)
             : [],
         },
       }
@@ -570,7 +656,6 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
     const plansIntent =
       applied.intent !== undefined &&
       (triage.outcome === 'new_action' || triage.outcome === 'correction')
-    let taskContext: string | null = null
     if (plansIntent) {
       const current = applied.intent!
       let planned = false
@@ -607,13 +692,54 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
           return { room: step ? activateStep(room, step.id) : room, value: undefined }
         })
       }
-      const planRoom = await loadRoom(ctx, base.pageId)
-      const tasks = visibleTasks(planRoom, current.id)
-      taskContext = tasks.length
-        ? `Plan tasks (keys):\n${tasks.map((task) => `${task.key}: ${task.description}`).join('\n')}`
-        : null
-      if (tasks.length > 0) await showDraft(ctx, base.pageId, key, base, tasks)
     }
+
+    const contextRoom = await loadRoom(ctx, base.pageId)
+    const intent = applied.intent
+      ? contextRoom.intents[applied.intent.id] ?? applied.intent
+      : null
+    const tasks = intent ? visibleTasks(contextRoom, intent.id) : []
+    const gathered = await gatherContext({
+      ctx,
+      pageId: base.pageId,
+      surface: 'body',
+      blockId: base.blockId,
+      threadId: base.threadId,
+      key: `${base.generation}:${base.text.length}:${base.text.slice(0, 80)}`,
+    })
+    const trigger: TriggerContext = {
+      surface: 'body',
+      change: 'updated',
+      text: base.text,
+      previousText: base.previousText,
+      threadId: base.threadId,
+      blockId: base.blockId,
+      messageId: base.messageId,
+      author: null,
+    }
+    const contextNow = new Date().toISOString()
+    const assembled = assembleContext({
+      purpose: triage.outcome === 'clarify' ? 'clarify' : 'reply',
+      trigger,
+      room: contextRoom,
+      target: contextRoom.targets[key] ?? null,
+      intent,
+      steps: intent ? stepsForVersion(contextRoom, intent.id, intent.version) : [],
+      planTasks: tasks.map((task) => ({
+        key: task.key,
+        description: task.description,
+        status: task.status,
+      })),
+      page: gathered.page,
+      threads: gathered.threads,
+      presence: gathered.page?.presence ?? [],
+      ownPrincipal: ctx.ownPrincipal,
+      degraded: gathered.degraded,
+      now: contextNow,
+    })
+    ctx.log(`context body ${base.blockId.slice(0, 8)} ${describeContext(assembled)}`)
+    if (tasks.length > 0) await showDraft(ctx, base.pageId, key, base, tasks)
+
     const system =
       triage.outcome === 'clarify'
         ? CLARIFY_SYSTEM_PROMPT
@@ -622,15 +748,7 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
             ? FOLLOWUP_SYSTEM_PROMPT
             : CORRECTION_SYSTEM_PROMPT
           : ANSWER_SYSTEM_PROMPT
-    const promptParts: string[] = []
-    if (taskContext) promptParts.push(taskContext)
-    if (triage.outcome === 'correction' && base.previousText)
-      promptParts.push(`Previous text: ${JSON.stringify(base.previousText)}`)
-    if (hasReply) promptParts.push(`Previous reply: ${JSON.stringify(base.lastReply)}`)
-    const prompt =
-      promptParts.length > 0
-        ? `${promptParts.join('\n\n')}\n\nCurrent text: ${JSON.stringify(base.text)}`
-        : base.text
+    const prompt = renderPrompt(assembled)
     const raw = await ctx.llm!.complete({ system, prompt, signal })
     const decision = parseDecision(raw)
     const outcome = await updateRoom(ctx, base.pageId, async (room) => {
@@ -640,11 +758,28 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         intentVersion: base.assumedIntentVersion,
         generation: base.generation,
       })
-      if (!fresh || !current) return { room, value: 'discarded' as const }
+      if (!fresh || !current) {
+        return {
+          room: appendTimeline(
+            room,
+            attemptEntry({
+              at: new Date().toISOString(),
+              key,
+              blockId: base.blockId,
+              generation: base.generation,
+              intentId: applied.intent?.id ?? null,
+              intentVersion: base.assumedIntentVersion,
+              kind: 'attempt_discarded',
+            }),
+          ),
+          value: 'discarded' as const,
+        }
+      }
       const intentId = applied.intent.id
       const tasks = visibleTasks(room, intentId)
       const doneKeys = completedTaskKeys(tasks, decision)
       let { threadId, messageId, lastReply } = fresh
+      const edited = Boolean(threadId && messageId)
       const body = tasks.length > 0 ? checklist(tasks, doneKeys, decision.reply) : decision.reply
       if (threadId && messageId) {
         await ctx.comments!.editMessage({
@@ -678,6 +813,22 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       if (plansIntent && intentId) {
         nextRoom = completePlan(nextRoom, intentId, doneKeys)
       }
+      nextRoom = appendTimeline(
+        nextRoom,
+        replyEntry({
+          at: new Date().toISOString(),
+          key,
+          surface: 'body',
+          blockId: fresh.blockId,
+          generation: fresh.generation,
+          intentId,
+          intentVersion: fresh.assumedIntentVersion,
+          threadId,
+          messageId,
+          body,
+          edited,
+        }),
+      )
       return { room: nextRoom, value: 'written' as const }
     })
     if (outcome === 'discarded') {
@@ -697,12 +848,25 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       if (!target) return { room, value: false }
       if (target.text !== base.text || target.generation !== base.generation)
         return { room, value: false }
+      const next = recordTarget(room, {
+        ...target,
+        failures: target.failures + 1,
+        lastAttemptAt: Date.now(),
+      })
       return {
-        room: recordTarget(room, {
-          ...target,
-          failures: target.failures + 1,
-          lastAttemptAt: Date.now(),
-        }),
+        room: appendTimeline(
+          next,
+          failureEntry({
+            at: new Date().toISOString(),
+            key,
+            surface: 'body',
+            blockId: target.blockId,
+            threadId: target.threadId,
+            generation: target.generation,
+            failures: target.failures + 1,
+            message,
+          }),
+        ),
         value: true,
       }
     })
@@ -770,12 +934,48 @@ async function handleComment(
   }
 
   const commentTasks = (proposal ?? []).filter((step) => step.kind === 'task')
-  const taskLines = commentTasks
-    .map((task) => `${task.key}: ${task.description}`)
-    .join('\n')
+  const gathered = await gatherContext({
+    ctx,
+    pageId,
+    surface: 'comment',
+    blockId: change.blockId,
+    threadId: change.threadId,
+    key: handleKey,
+  })
+  const trigger: TriggerContext = {
+    surface: 'comment',
+    change: change.change,
+    text: change.body ?? '',
+    previousText: null,
+    threadId: change.threadId,
+    blockId: change.blockId,
+    messageId: change.messageId,
+    author: change.authorDisplayName ?? change.driver,
+  }
+  const assembled = assembleContext({
+    purpose: triage.outcome === 'clarify' ? 'clarify' : 'reply',
+    trigger,
+    room: snapshot,
+    target: null,
+    intent: prior ?? null,
+    intentKind: kindFor(triage.outcome),
+    steps: prior ? stepsForVersion(snapshot, prior.id, prior.version) : [],
+    planTasks: commentTasks.map((task) => ({
+      key: task.key,
+      description: task.description,
+      status: 'pending',
+    })),
+    page: gathered.page,
+    threads: gathered.threads,
+    presence: gathered.page?.presence ?? [],
+    ownPrincipal: ctx.ownPrincipal,
+    degraded: gathered.degraded,
+    now: at,
+  })
+  ctx.log(`context comment ${where} ${describeContext(assembled)}`)
   const raw = await ctx.llm!.complete({
     system: triage.outcome === 'clarify' ? CLARIFY_SYSTEM_PROMPT : COMMENT_SYSTEM_PROMPT,
-    prompt: `Thread ${change.threadId}\nComment: ${change.body ?? ''}${taskLines ? `\n\nPlan tasks (keys):\n${taskLines}` : ''}`,
+    prompt: renderPrompt(assembled),
   })
   const decision = parseDecision(raw)
 
@@ -783,8 +983,30 @@ async function handleComment(
     if (commentHandled(room, change.threadId, handleKey))
       return { room, value: 'duplicate' as const }
     const applied = applyTriage(room, triageInput, at, true)
-    let next = applied.room
+    const priorVersion = applied.intent
+      ? room.intents[applied.intent.id]?.version ?? 0
+      : 0
+    let next = appendTimeline(
+      applied.room,
+      triageEntry({
+        eventId: `${eventId}:${change.messageId ?? change.threadId}`,
+        at,
+        surface: 'comment',
+        scope,
+        triage,
+      }),
+    )
     const intent = applied.intent
+    if (intent && priorVersion > 0 && intent.version > priorVersion) {
+      next = appendTimeline(
+        next,
+        intentVersionEntry({
+          at,
+          intent,
+          previousVersion: priorVersion,
+        }),
+      )
+    }
     if (plansIntent && intent) {
       next = planIntent(
         next,
@@ -799,7 +1021,7 @@ async function handleComment(
     const doneKeys = completedTaskKeys(tasks, decision)
     const body =
       tasks.length > 0 ? checklist(tasks, doneKeys, decision.reply) : decision.reply
-    await ctx.comments!.replyToThread({
+    const posted = await ctx.comments!.replyToThread({
       threadId: change.threadId,
       body,
       dedupeOn: handleKey,
@@ -809,6 +1031,22 @@ async function handleComment(
       next = attachThreadToIntent(next, intent.id, change.threadId)
       if (plansIntent) next = completePlan(next, intent.id, doneKeys)
     }
+    next = appendTimeline(
+      next,
+      replyEntry({
+        at: new Date().toISOString(),
+        key: handleKey,
+        surface: 'comment',
+        blockId: change.blockId,
+        generation: 0,
+        intentId: intent?.id ?? null,
+        intentVersion: intent?.version ?? null,
+        threadId: change.threadId,
+        messageId: posted.messageId,
+        body,
+        edited: false,
+      }),
+    )
     return { room: next, value: 'posted' as const }
   })
   if (result === 'posted')
@@ -837,13 +1075,19 @@ export default defineProgram({
     if (event.titleChanged) ctx.log(`title → ${JSON.stringify(event.title)}`)
     for (const change of event.changes) {
       if (change.surface === 'comment') {
-        await updateRoom(ctx, event.pageId, (room) => ({
-          room:
-            change.change === 'deleted'
-              ? forgetThread(room, change.threadId)
-              : recordCommentEvidence(room, change, event.id, event.at),
-          value: undefined,
-        }))
+        await updateRoom(ctx, event.pageId, (room) => {
+          const deleted = change.change === 'deleted'
+          const next = deleted
+            ? forgetThread(room, change.threadId)
+            : recordCommentEvidence(room, change, event.id, event.at)
+          return {
+            room: appendTimeline(
+              next,
+              userCommentEntry({ eventId: event.id, at: event.at, change, deleted }),
+            ),
+            value: undefined,
+          }
+        })
         ctx.log(describeComment(change))
         if (ctx.llm && ctx.comments) await handleComment(change, ctx, event.pageId, event.id, event.at)
         continue

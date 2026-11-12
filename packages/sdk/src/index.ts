@@ -82,6 +82,103 @@ export type ProgramEvent = PageChangedEvent
 /** Every event type a manifest may subscribe to. */
 export const eventTypes = ['page.changed'] as const satisfies readonly ProgramEvent['type'][]
 
+/** A scoped page read, captured at one revision. Mirrors `read_page`. */
+export type PageBlock = {
+  id: string
+  markdown: string
+  partial?: boolean
+  nodeRange?: { blockId: string; from: number; to: number }
+}
+
+export type PageOutlineEntry = {
+  blockId: string
+  nodeIndex: number
+  nodeId: string | null
+  type: string
+  headingPath: string[]
+  heading?: string
+  level?: number
+  markdownBytes: number
+}
+
+export type PresenceSelection = {
+  blockId: string
+  status: string
+  kind: 'caret' | 'selection' | null
+  startUtf16: number | null
+  endUtf16: number | null
+  quote: string | null
+}
+
+export type PresenceParticipant = {
+  peerId: string
+  principal: string
+  displayName: string | null
+  driver: string | null
+  lastSeen: string | null
+  selection: PresenceSelection | null
+}
+
+export type PageRead = {
+  title: string
+  heads: string[]
+  commentHeads: string[] | null
+  blocks: PageBlock[]
+  outline: PageOutlineEntry[]
+  presence: PresenceParticipant[]
+}
+
+export type ThreadAuthor = {
+  principal: string | null
+  displayName: string | null
+  driver: string | null
+  agent: { name: string | null; model: string | null } | null
+}
+
+export type ThreadMessage = {
+  id: string
+  body: string | null
+  author: ThreadAuthor | null
+  createdAt: string | null
+  deletedAt: string | null
+  /** True when the message was authored by this host's own principal. */
+  isSelf: boolean
+}
+
+export type ThreadRead = {
+  id: string
+  state: string | null
+  blockId: string | null
+  selection: { text: string } | null
+  messageCount: number
+  messages: ThreadMessage[]
+}
+
+export type PageReadInput = {
+  blockIds?: string[]
+  includeContent?: boolean
+  includePresence?: boolean
+  maxBytes?: number
+}
+
+export type CommentReadInput = {
+  blockId?: string
+  threadIds?: string[]
+  state?: 'open' | 'resolved' | 'all'
+  includeMessages?: boolean
+  maxBytes?: number
+}
+
+/**
+ * Read-only page context. The host supplies the Pages client; a program never
+ * talks to the network itself. Reads are scoped and best-effort: a caller must
+ * be able to answer from the trigger alone when a read is unavailable.
+ */
+export type ReadsCapability = {
+  page(input?: PageReadInput): Promise<PageRead>
+  comments(input?: CommentReadInput): Promise<ThreadRead[]>
+}
+
 export type ProgramState = {
   get<T>(key: string): Promise<T | undefined>
   set<T>(key: string, value: T): Promise<void>
@@ -170,6 +267,8 @@ export type PresenceCapability = {
 export type ProgramContext = {
   /** The page this instance is watching. */
   pageId?: string
+  /** The host's own principal when known, for recognizing its own comments and presence. */
+  ownPrincipal?: string | null
   log(message: string, data?: Record<string, unknown>): void
   state: ProgramState
   scratch: ScratchState
@@ -177,6 +276,8 @@ export type ProgramContext = {
   llm?: LlmCapability
   comments?: CommentsCapability
   presence?: PresenceCapability
+  /** Present when the host can read page content and comments for context. */
+  reads?: ReadsCapability
 }
 
 export type Program = {

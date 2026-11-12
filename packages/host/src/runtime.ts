@@ -9,6 +9,8 @@ import {
   replyToComment,
   openCursor,
   pollPage,
+  readComments,
+  readPage,
   showReadingPresence,
   type PageCursor,
 } from '@pages-programs/pages'
@@ -59,8 +61,21 @@ export async function runProgram(options: RunOptions): Promise<void> {
   // (program, page) instances even though a program module is imported once and reused.
   const scratch = new Map<string, unknown>()
 
+  // One identity read, not one per poll. Without it we cannot tell echo's own
+  // comments from a person's, so comment and presence watching is disabled
+  // rather than risking a self-reply loop. Read context uses the same identity
+  // to mark the host's own messages as self.
+  let ownPrincipal: string | null = null
+  try {
+    ownPrincipal = (await client.whoami()).principal
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    options.log(`comment/selection watching disabled: ${message}`)
+  }
+
   const ctx: ProgramContext = {
     pageId,
+    ownPrincipal,
     log: (message, data) => options.log(data ? `${message} ${JSON.stringify(data)}` : message),
     state: {
       get: async <T>(key: string) => kv[key] as T | undefined,
@@ -90,22 +105,19 @@ export async function runProgram(options: RunOptions): Promise<void> {
     presence: {
       showReading: (blockId) => showReadingPresence(client, { pageId, blockId }),
     },
+    reads: {
+      page: async (input) => {
+        const page = await readPage(client, pageId, input)
+        // Without our own principal we cannot tell our presence from a person's.
+        return ownPrincipal ? page : { ...page, presence: [] }
+      },
+      comments: (input) => readComments(client, pageId, input, { ownPrincipal }),
+    },
   }
 
   const persist = () => store.save({ cursor, kv, lastEventId })
   await persist()
   options.log(`watching ${cursor.title ?? pageId} @ ${cursor.heads[0]?.slice(0, 8)} as "${program.manifest.name}"`)
-
-  // One identity read, not one per poll. Without it we cannot tell echo's own
-  // comments from a person's, so comment and presence watching is disabled
-  // rather than risking a self-reply loop.
-  let ownPrincipal: string | null = null
-  try {
-    ownPrincipal = (await client.whoami()).principal
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    options.log(`comment/selection watching disabled: ${message}`)
-  }
 
   while (!signal.aborted) {
     try {

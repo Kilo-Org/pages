@@ -153,6 +153,96 @@ describe('runProgram', () => {
     expect(store.peek()?.lastEventId).toBe(eventId(['h1']))
   })
 
+  test('wires scoped reads and the own principal into ctx', async () => {
+    const controller = new AbortController()
+    let seen: { ownPrincipal?: string | null; hasReads: boolean } | undefined
+    const program = defineProgram({
+      manifest: { name: 't', triggers: ['page.changed'] },
+      key: (e) => e.pageId,
+      handle: async () => {},
+      tick: async (ctx) => {
+        seen = {
+          ownPrincipal: ctx.ownPrincipal,
+          hasReads: typeof ctx.reads?.page === 'function' && typeof ctx.reads.comments === 'function',
+        }
+        controller.abort()
+      },
+    })
+    const { client } = fakePages({
+      read_page: [opened],
+      read_page_changes: [changes(['h0'], [])],
+    })
+    await runProgram({
+      program,
+      client,
+      pageId: 'p',
+      store: memoryStore(),
+      intervalMs: 1,
+      signal: controller.signal,
+      log: () => {},
+    })
+    expect(seen).toEqual({ ownPrincipal: 'self', hasReads: true })
+  })
+
+  test('a whoami failure leaves reads available but without a self principal', async () => {
+    const controller = new AbortController()
+    let seen: { ownPrincipal?: string | null; hasReads: boolean; presence: number } | undefined
+    const program = defineProgram({
+      manifest: { name: 't', triggers: ['page.changed'] },
+      key: (e) => e.pageId,
+      handle: async () => {},
+      tick: async (ctx) => {
+        const page = await ctx.reads!.page()
+        seen = {
+          ownPrincipal: ctx.ownPrincipal,
+          hasReads: typeof ctx.reads?.page === 'function',
+          presence: page.presence.length,
+        }
+        controller.abort()
+      },
+    })
+    const withPresence = {
+      body: {
+        title: 'T',
+        heads: ['h0'],
+        presence: {
+          participants: [
+            {
+              peer_id: 'peer-1',
+              principal: 'person-1',
+              displayName: 'Sam',
+              driver: 'Browser',
+              last_seen: '2026-11-10T00:00:00.000Z',
+              selection: {
+                block_id: 'b1',
+                status: 'attached',
+                kind: 'selection',
+                start_utf16: 0,
+                end_utf16: 3,
+                quote: 'abc',
+              },
+            },
+          ],
+        },
+      },
+    }
+    const { client } = fakePages({
+      whoami: [{ status: 500, body: { code: 'request_failed', error: 'no identity' } }],
+      read_page: [opened, withPresence],
+      read_page_changes: [changes(['h0'], [])],
+    })
+    await runProgram({
+      program,
+      client,
+      pageId: 'p',
+      store: memoryStore(),
+      intervalMs: 1,
+      signal: controller.signal,
+      log: () => {},
+    })
+    expect(seen).toEqual({ ownPrincipal: null, hasReads: true, presence: 0 })
+  })
+
   test('calls tick every poll, even with no event, with llm/comments wired into ctx', async () => {
     const controller = new AbortController()
     const seen: { hasLlm: boolean; hasComments: boolean }[] = []

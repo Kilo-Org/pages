@@ -103,6 +103,47 @@ export type SelectionEvidence = {
   observedAt: string
 }
 
+/** Compact, append-only activity. This is the archivist's warm tier: what
+ * happened, not a second copy of the page and not a transcript. */
+export type TimelineEntryKind =
+  | 'user_edit'
+  | 'user_comment'
+  | 'triage'
+  | 'intent_version'
+  | 'attempt_started'
+  | 'attempt_discarded'
+  | 'reply_written'
+  | 'reply_updated'
+  | 'reply_skipped'
+  | 'failure'
+
+export type TimelineScope = {
+  blockId?: string
+  nodeKey?: string
+  threadId?: string
+}
+
+export type TimelineEntry = {
+  /** Stable across redeliveries: a repeated event cannot append a second row. */
+  id: string
+  at: string
+  kind: TimelineEntryKind
+  surface: 'body' | 'comment' | 'room'
+  scope: TimelineScope
+  intentId?: string
+  messageId?: string
+  /** Deterministic, compact, at most TIMELINE_SUMMARY_MAX characters. */
+  summary: string
+  data?: {
+    added?: string
+    removed?: string
+    outcome?: string
+    reason?: string
+    intentVersion?: number
+    source?: 'rules' | 'model'
+  }
+}
+
 export type RoomState = {
   schemaVersion: 1
   pageId: string
@@ -114,6 +155,8 @@ export type RoomState = {
   selections: Record<string, SelectionEvidence>
   /** threadId -> last message echo handled, so a redelivered event cannot double-reply. */
   handledComments: Record<string, string>
+  /** Optional so a saved room written before the archivist remains readable. */
+  timeline?: TimelineEntry[]
 }
 
 export const emptyRoom = (pageId = ''): RoomState => ({
@@ -125,6 +168,7 @@ export const emptyRoom = (pageId = ''): RoomState => ({
   targets: {},
   selections: {},
   handledComments: {},
+  timeline: [],
 })
 
 const scopeKey = (scope: TargetScope) =>

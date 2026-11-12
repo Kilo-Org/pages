@@ -648,5 +648,10 @@ describe('migration', () => {
       assumedIntentVersion: null,
     })
     expect(room.targets['nodes/b2:0']).toBeUndefined()
+    expect(room.timeline).toEqual([])
+  })
+
+  test('an empty room starts with an empty archivist timeline', () => {
+    expect(emptyRoom('p').timeline).toEqual([])
   })
 })
