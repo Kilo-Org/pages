@@ -17,6 +17,7 @@ function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability; p
   const kv: Record<string, unknown> = {}
   const scratch = new Map<string, unknown>()
   const ctx: ProgramContext = {
+    pageId: 'p',
     log: (message) => void lines.push(message),
     state: {
       get: async <T>(key: string) => kv[key] as T | undefined,
@@ -1412,6 +1413,110 @@ describe('plan steps — the to-do list behind an intent', () => {
     expect(comments.edits.some((edit) => edit.dedupeOn.startsWith('plan:'))).toBe(true)
     expect(comments.edits.at(-1)?.dedupeOn.startsWith('reply:')).toBe(true)
     expect(comments.edits.at(-1)?.body).toContain('Updated summary.')
+    expect(comments.posts).toHaveLength(1)
+  })
+})
+
+function manualLlm() {
+  let reject!: (error: Error) => void
+  const llm: LlmCapability = {
+    complete: () =>
+      new Promise<string>((_resolve, rejectPromise) => {
+        reject = rejectPromise
+      }),
+  }
+  return { llm, reject: (error: Error) => reject(error) }
+}
+
+describe('failure fencing and thread lifecycle', () => {
+  test('a failure for text that moved on is not charged to the new text', async () => {
+    const manual = manualLlm()
+    const { ctx } = harness({ llm: manual.llm, comments: fakeComments() })
+    await echo.handle(event(1, [node('updated', 'Old question?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    await echo.handle(event(2, [node('updated', 'New question?')]), ctx)
+    manual.reject(new Error('gateway down'))
+    await flush()
+
+    const saved = await savedTarget(ctx)
+    expect(saved).toMatchObject({ text: 'New question?', failures: 0 })
+  })
+
+  test('a deleted thread clears reply identity and the next edit posts a new thread', async () => {
+    const llm = fakeLlm(() => ({ respond: true, reply: 'Yes.' }))
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
+    await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const first = kv.room as RoomState
+    const intentId = Object.keys(first.intents)[0]!
+    expect(first.intents[intentId]?.targetScope.threadId).toBe('thread-1')
+
+    await echo.handle(
+      event(2, [
+        {
+          surface: 'comment',
+          change: 'deleted',
+          threadId: 'thread-1',
+          messageId: null,
+          blockId: null,
+          body: null,
+          authorPrincipal: null,
+          authorDisplayName: null,
+          driver: null,
+          actorKind: 'unknown',
+          priority: 2,
+        },
+      ]),
+      ctx,
+    )
+
+    const afterDelete = kv.room as RoomState
+    expect(afterDelete.targets['nodes/b1:0']).toMatchObject({
+      threadId: null,
+      messageId: null,
+      lastReply: null,
+    })
+    expect(afterDelete.intents[intentId]?.status).toBe('abandoned')
+
+    await echo.handle(event(3, [node('updated', 'Another question?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(comments.posts).toHaveLength(2)
+    expect(comments.edits).toHaveLength(0)
+    const afterEdit = kv.room as RoomState
+    expect(afterEdit.targets['nodes/b1:0']?.threadId).toBe('thread-2')
+  })
+
+  test('a tick-only migration uses the context page id', async () => {
+    const llm = fakeLlm(() => ({ respond: true, reply: 'Yes.' }))
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
+    kv['nodes/b1:0'] = {
+      blockId: 'b1',
+      text: 'Does it work?',
+      changedAt: Date.now() - SPECULATIVE_PAUSE_MS - 100,
+      evaluatedText: null,
+      failures: 0,
+      lastAttemptAt: 0,
+      threadId: null,
+      messageId: null,
+      lastReply: null,
+      generation: 1,
+      assumedIntentVersion: null,
+    }
+
+    await echo.tick!(ctx)
+    await flush()
+
+    const room = kv.room as RoomState
+    expect(room.pageId).toBe('p')
+    expect(room.targets['nodes/b1:0']?.pageId).toBe('p')
     expect(comments.posts).toHaveLength(1)
   })
 })

@@ -93,24 +93,30 @@ The same poll also watches the page's two other user surfaces:
 Echo keeps one `room` value in `ctx.state`: the durable "what is being asked"
 ledger plus the bookkeeping the executor needs.
 
-- `intents` — one per target, with `kind`, `status`, `version`,
-  `targetScope`, `outputKind`, `confidence`, and evidence.
+- `intents` — one per target, with a unique id, `kind`, `status`, `version`,
+  `targetScope`, `outputKind`, `confidence`, and evidence. A new admission
+  after an abandoned intent keeps the old entry.
 - `steps` — ordered work for one intent version: 1–30 steps with `kind`,
   `position`, and `dependsOn`. `new_action` and `correction` get a plan;
   `chat` and `clarify` do not. A version bump marks older steps `stale`;
   they are cancelled only when unowned.
 - `targets` — per-node reply identity (`threadId`/`messageId`/`lastReply`),
   dedupe text, backoff, and the `generation` / `assumedIntentVersion` fence.
-- `selections` — the latest person selection per peer, used as scope evidence.
+- `selections` — the latest person selection per peer, with one evidence ref
+  per peer in the intent.
 
 Triage creates the target's intent (action, correction, chat, or clarify);
-a later change to an active target bumps its version. `attempt()` reads the
-model outside the room lock, then re-checks text, generation, and intent
-version immediately before writing. The lock covers the check and the write,
-not the model call, so one slow draft does not block other targets.
+a later change to an active target bumps its version. The first reply
+attaches its thread to the intent. `attempt()` reads the model outside the
+room lock, then re-checks text, generation, and intent version immediately
+before writing. The lock covers the check and the write, not the model call,
+so one slow draft does not block other targets.
 
 PR 3's flat `nodes/*` records are migrated once into `room.targets` on first
-read. The old keys stay in place so a rollback still has reply identity.
+read. While the room is introduced, changed target records are also written
+back to their `nodes/*` keys, so a rollback to PR 3 keeps reply identity for
+new writes. A deleted thread clears the target's reply identity so the next
+edit creates a new thread instead of retrying an edit against a deleted one.
 
 ## Triaging before answering
 

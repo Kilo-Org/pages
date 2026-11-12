@@ -60,6 +60,7 @@ export async function runProgram(options: RunOptions): Promise<void> {
   const scratch = new Map<string, unknown>()
 
   const ctx: ProgramContext = {
+    pageId,
     log: (message, data) => options.log(data ? `${message} ${JSON.stringify(data)}` : message),
     state: {
       get: async <T>(key: string) => kv[key] as T | undefined,

@@ -106,6 +106,8 @@ export type SelectionEvidence = {
 export type RoomState = {
   schemaVersion: 1
   pageId: string
+  /** Monotonic local id source; intent ids stay unique after an intent is abandoned. */
+  intentSeq: number
   intents: Record<string, Intent>
   steps: Record<string, PlanStep>
   targets: Record<string, TargetState>
@@ -117,6 +119,7 @@ export type RoomState = {
 export const emptyRoom = (pageId = ''): RoomState => ({
   schemaVersion: 1,
   pageId,
+  intentSeq: 0,
   intents: {},
   steps: {},
   targets: {},
@@ -199,28 +202,6 @@ export function findIntentForBlock(room: RoomState, blockId: string): Intent | u
   return Object.values(room.intents).find(
     (intent) => intent.status === 'active' && intent.targetScope.blockId === blockId,
   )
-}
-
-export function attachThreadToIntent(
-  room: RoomState,
-  intentId: string,
-  threadId: string,
-): RoomState {
-  const intent = room.intents[intentId]
-  if (!intent) return room
-  return copyIntents(room, {
-    ...room.intents,
-    [intentId]: { ...intent, targetScope: { ...intent.targetScope, threadId } },
-  })
-}
-
-export function closeIntentForThread(room: RoomState, threadId: string): RoomState {
-  const intent = findIntentForThread(room, threadId)
-  if (!intent) return room
-  return copyIntents(room, {
-    ...room.intents,
-    [intent.id]: { ...intent, status: 'abandoned' },
-  })
 }
 
 export function commentHandled(room: RoomState, threadId: string, messageId: string): boolean {
@@ -313,7 +294,8 @@ export function admitIntent(
   },
   now: string,
 ): { room: RoomState; intent: Intent } {
-  const id = input.id ?? `${scopeKey(input.targetScope)}:${input.kind}`
+  const intentSeq = room.intentSeq + 1
+  const id = input.id ?? `${scopeKey(input.targetScope)}:${input.kind}:${intentSeq}`
   const intent: Intent = {
     id,
     kind: input.kind,
@@ -327,7 +309,7 @@ export function admitIntent(
     updatedAt: now,
   }
   return {
-    room: copyIntents(room, { ...room.intents, [id]: intent }),
+    room: { ...copyIntents(room, { ...room.intents, [id]: intent }), intentSeq },
     intent,
   }
 }
@@ -501,7 +483,6 @@ export function noteUserChange(
   room: RoomState,
   targetKey: string,
   intentId: string | null,
-  now: string,
 ): RoomState {
   const target = room.targets[targetKey]
   const intent = intentId ? room.intents[intentId] : undefined
@@ -555,6 +536,58 @@ export function closeIntentForTarget(room: RoomState, targetKey: string): RoomSt
   })
 }
 
+export function closeIntentForThread(room: RoomState, threadId: string): RoomState {
+  const intent = findIntentForThread(room, threadId)
+  if (!intent) return room
+  return copyIntents(room, {
+    ...room.intents,
+    [intent.id]: { ...intent, status: 'abandoned' },
+  })
+}
+
+/** Links a body intent to the thread its first reply created. */
+export function attachThreadToIntent(
+  room: RoomState,
+  intentId: string,
+  threadId: string,
+): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent || intent.targetScope.threadId === threadId) return room
+  return copyIntents(room, {
+    ...room.intents,
+    [intentId]: {
+      ...intent,
+      targetScope: { ...intent.targetScope, threadId },
+    },
+  })
+}
+
+/**
+ * A deleted thread must not leave a target pointing at it: the next attempt
+ * would call edit_message forever. Keep the target's evaluated text so echo
+ * does not immediately re-post; the next edit will create a new thread.
+ */
+export function forgetThread(room: RoomState, threadId: string): RoomState {
+  let next = room
+  let changed = false
+  const targets = Object.fromEntries(
+    Object.entries(room.targets).map(([key, target]) => {
+      if (target.threadId !== threadId) return [key, target]
+      changed = true
+      const intent = findActiveIntentForTarget(room, key)
+      if (intent) {
+        next = copyIntents(next, {
+          ...next.intents,
+          [intent.id]: { ...intent, status: 'abandoned' },
+        })
+      }
+      return [key, { ...target, threadId: null, messageId: null, lastReply: null }]
+    }),
+  )
+  if (changed) next = copyTargets(next, targets)
+  return closeIntentForThread(next, threadId)
+}
+
 /**
  * A body change bumps the target generation and either creates the target's
  * intent or bumps its version, marking older plan steps stale. PR 5 replaces
@@ -567,24 +600,21 @@ export function recordBodyChange(
   now: string,
 ): RoomState {
   const prior = room.targets[target.key]
-  const generation = (prior?.generation ?? 0) + 1
+  // noteUserChange increments the room's generation; make the incoming target
+  // carry that baseline even when a caller built it without the prior value.
+  const nextTarget = prior ? { ...target, generation: prior.generation } : target
   const existing = findActiveIntentForTarget(room, target.key)
   // Triage decides whether this change is an action, correction, chat or
   // clarification, and creates the intent. Here we only carry the fence forward.
   if (!existing) {
-    return recordTarget(room, {
-      ...target,
-      generation,
-      assumedIntentVersion: null,
-    })
+    return noteUserChange(
+      recordTarget(room, { ...nextTarget, assumedIntentVersion: null }),
+      target.key,
+      null,
+    )
   }
-  const bumped = bumpIntentVersion(room, existing.id, evidence, now)
-  const cancelled = cancelStaleSteps(bumped, existing.id)
-  return recordTarget(cancelled, {
-    ...target,
-    generation,
-    assumedIntentVersion: cancelled.intents[existing.id]?.version ?? existing.version + 1,
-  })
+  const bumped = cancelStaleSteps(bumpIntentVersion(room, existing.id, evidence, now), existing.id)
+  return noteUserChange(recordTarget(bumped, nextTarget), target.key, existing.id)
 }
 
 /** Comment changes are evidence for an intent, not new intent creation. */
@@ -617,6 +647,21 @@ export function recordCommentEvidence(
   })
 }
 
+const selectionEvidenceId = (peerId: string) => `selection:${peerId}`
+
+/** Removes a peer's selection evidence from every intent. */
+function withoutSelectionEvidence(room: RoomState, peerId: string): Record<string, Intent> {
+  const evidenceId = selectionEvidenceId(peerId)
+  return Object.fromEntries(
+    Object.entries(room.intents).map(([id, intent]) => [
+      id,
+      intent.evidence.some((ref) => ref.eventId === evidenceId)
+        ? { ...intent, evidence: intent.evidence.filter((ref) => ref.eventId !== evidenceId) }
+        : intent,
+    ]),
+  )
+}
+
 export function noteSelection(room: RoomState, change: SelectionChange): RoomState {
   const evidence: SelectionEvidence = {
     peerId: change.peerId,
@@ -628,20 +673,20 @@ export function noteSelection(room: RoomState, change: SelectionChange): RoomSta
     quote: change.quote,
     observedAt: change.observedAt,
   }
-  const intent = findIntentForBlock(room, change.blockId)
-  const intents = intent
-    ? {
-        ...room.intents,
-        [intent.id]: {
-          ...intent,
-          evidence: [
-            ...intent.evidence,
-            { eventId: `selection:${change.peerId}:${change.observedAt}`, at: change.observedAt },
-          ],
-          updatedAt: change.observedAt,
-        },
-      }
-    : room.intents
+  // Keep at most one selection evidence ref per peer, even as it moves across
+  // blocks or is reported many times.
+  const intents = withoutSelectionEvidence(room, change.peerId)
+  const intent = findIntentForBlock({ ...room, intents }, change.blockId)
+  if (intent) {
+    intents[intent.id] = {
+      ...intent,
+      evidence: [
+        ...intent.evidence,
+        { eventId: selectionEvidenceId(change.peerId), at: change.observedAt },
+      ],
+      updatedAt: change.observedAt,
+    }
+  }
   return {
     ...room,
     intents,
@@ -653,7 +698,11 @@ export function clearSelection(room: RoomState, peerId: string): RoomState {
   if (!room.selections[peerId]) return room
   const selections = { ...room.selections }
   delete selections[peerId]
-  return { ...room, selections }
+  return {
+    ...room,
+    intents: withoutSelectionEvidence(room, peerId),
+    selections,
+  }
 }
 
 /** One-time upgrade from PR 3's flat per-target records. Leaves `nodes/*` in
