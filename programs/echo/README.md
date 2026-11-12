@@ -95,7 +95,7 @@ ledger plus the bookkeeping the executor needs.
 
 - `intents` — one per target, with `kind`, `status`, `version`,
   `targetScope`, `outputKind`, `confidence`, and evidence.
-- `steps` — ordered work for one intent version: 1–5 steps with `kind`,
+- `steps` — ordered work for one intent version: 1–30 steps with `kind`,
   `position`, and `dependsOn`. `new_action` and `correction` get a plan;
   `chat`, `clarify`, and `ignore` do not. A version bump marks older steps
   `stale`; they are cancelled only when unowned.
@@ -143,12 +143,27 @@ model declines one of those outcomes anyway, echo logs `declined …: triage
 
 For `new_action` and `correction`, echo asks the model for an ordered plan
 through the `todo_write` tool, then the room validates and persists it.
-Steps are limited to executable kinds (`draft_reply`, `post_reply`,
-`edit_reply`); a plan that names unsupported work, repeats keys, has a cycle,
-or uses `edit_reply` without an existing reply is rejected. Hosts without
-`completeWithTools` fall back to `draft → post` (or `draft → edit` for a
-body correction). Chat never gets a plan, so a knowledge answer cannot become
-a hidden to-do item.
+`task` steps are the user-facing deliverables; `draft_reply`, `post_reply`,
+and `edit_reply` are execution steps. A multi-part request should have one
+task per deliverable, which becomes a visible checklist. A single-deliverable
+request has no task steps, so it gets a normal reply.
+
+For a body action with task steps, echo posts an unchecked checklist before
+generation and edits the same message to the checked list plus the answer.
+For a comment action, the threaded reply includes the checked list. The list
+is not a separate page block: comments are the only visible write surface
+today. The answer returns `completedTasks` keys, so a partial reply checks
+only the tasks it finished and leaves the rest pending; `completed: false`
+keeps everything unchecked. Hosts without `completeWithTools` fall back to
+`draft → post` (or `draft → edit` for a body correction), which has no task
+steps and therefore no checklist. Chat never gets a plan, so a knowledge
+answer cannot become a hidden to-do item.
+
+A plan that names unsupported work, repeats keys, or has a cycle is rejected.
+`post_reply` and `edit_reply` are normalized to what the executor will do:
+edit when a reply already exists, post otherwise. Draft and final writes use
+different idempotency prefixes (`plan:` and `reply:`), so editing the
+checklist cannot collide with the final edit.
 
 A comment on an active thread is answered in that thread with
 `replyToThread`, not by creating a new block comment. The handled message

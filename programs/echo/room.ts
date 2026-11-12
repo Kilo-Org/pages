@@ -38,9 +38,14 @@ export type Intent = {
 export type StepStatus = 'pending' | 'active' | 'done' | 'stale' | 'cancelled'
 
 /** Steps the executor can actually perform. A free-text plan is not executable. */
-export type StepKind = 'draft_reply' | 'post_reply' | 'edit_reply'
+export type StepKind = 'task' | 'draft_reply' | 'post_reply' | 'edit_reply'
 
-export const STEP_KINDS: readonly StepKind[] = ['draft_reply', 'post_reply', 'edit_reply']
+export const STEP_KINDS: readonly StepKind[] = [
+  'task',
+  'draft_reply',
+  'post_reply',
+  'edit_reply',
+]
 
 export type PlanStepInput = {
   key: string
@@ -51,6 +56,8 @@ export type PlanStepInput = {
 
 export type PlanStep = {
   id: string
+  /** Plan-local key from the proposal, stable across versions. */
+  key: string
   intentId: string
   intentVersion: number
   status: StepStatus
@@ -128,7 +135,7 @@ const PLAN_KEY = /^[A-Za-z0-9_-]{1,40}$/
 /** Returns a human-readable problem, or null when the proposed plan is usable. */
 export function validatePlanSteps(steps: PlanStepInput[]): string | null {
   if (steps.length < 1) return 'plan needs at least one step'
-  if (steps.length > 5) return 'plan supports at most five steps'
+  if (steps.length > 30) return 'plan supports at most thirty steps'
   const keys = new Set<string>()
   for (const step of steps) {
     if (!PLAN_KEY.test(step.key)) return `invalid step key ${JSON.stringify(step.key)}`
@@ -255,7 +262,9 @@ export function applyTriage(
     (input.intentId && room.intents[input.intentId]) ||
     (input.targetScope.threadId && findIntentForThread(room, input.targetScope.threadId)) ||
     (input.targetScope.nodeKey && findActiveIntentForTarget(room, input.targetScope.nodeKey)) ||
-    (input.targetScope.blockId && findIntentForBlock(room, input.targetScope.blockId)) ||
+    (input.targetScope.threadId &&
+      input.targetScope.blockId &&
+      findIntentForBlock(room, input.targetScope.blockId)) ||
     undefined
   if (!intent) {
     const admitted = admitIntent(
@@ -414,6 +423,7 @@ export function planIntent(
   const ids = new Map(steps.map((step) => [step.key, stepId(intentId, version, step.key)]))
   const planned: PlanStep[] = steps.map((step, position) => ({
     id: ids.get(step.key)!,
+    key: step.key,
     intentId,
     intentVersion: version,
     status: 'pending',
@@ -456,13 +466,22 @@ export function failStep(room: RoomState, id: string): RoomState {
   return { ...room, steps: { ...room.steps, [id]: { ...step, status: 'pending' } } }
 }
 
-/** The whole current plan finished in one executor pass. */
-export function completePlan(room: RoomState, intentId: string): RoomState {
+/**
+ * Completes the current plan after one executor pass. When `doneTaskKeys` is
+ * given, task steps outside that set stay pending; execution steps always finish.
+ */
+export function completePlan(
+  room: RoomState,
+  intentId: string,
+  doneTaskKeys?: ReadonlySet<string>,
+): RoomState {
   const intent = room.intents[intentId]
   if (!intent) return room
   let next = room
   for (const step of stepsForVersion(room, intentId, intent.version)) {
-    if (step.status === 'pending' || step.status === 'active') next = completeStep(next, step.id)
+    if (step.status !== 'pending' && step.status !== 'active') continue
+    if (step.kind === 'task' && doneTaskKeys && !doneTaskKeys.has(step.key)) continue
+    next = completeStep(next, step.id)
   }
   return next
 }

@@ -119,7 +119,7 @@ export const TODO_WRITE_TOOL: LlmTool = {
       steps: {
         type: 'array',
         minItems: 1,
-        maxItems: 5,
+        maxItems: 30,
         items: {
           type: 'object',
           additionalProperties: false,
@@ -129,7 +129,7 @@ export const TODO_WRITE_TOOL: LlmTool = {
               type: 'string',
               enum: [...STEP_KINDS],
               description:
-                'draft_reply produces response text; post_reply posts it; edit_reply replaces an existing reply.',
+                'task is a visible deliverable; draft_reply produces response text; post_reply posts it; edit_reply replaces an existing reply.',
             },
             description: { type: 'string', description: 'What this step does, in one sentence.' },
             dependsOn: {
@@ -148,10 +148,14 @@ export const TODO_WRITE_TOOL: LlmTool = {
 
 export const PLAN_SYSTEM_PROMPT = [
   'You plan the work for one assistant intent on a collaborative page.',
-  'Call todo_write exactly once with an ordered plan of 1-5 steps.',
-  'Allowed kinds: draft_reply (produce reply text), post_reply (post it in a comment),',
-  'edit_reply (replace an existing reply). Do not invent steps the assistant cannot perform.',
-  'Use dependsOn to order steps. Keep descriptions concrete and short.',
+  'Call todo_write exactly once with an ordered plan of 1-30 steps.',
+  'Use task for each distinct user-facing deliverable that should appear in a visible checklist.',
+  'If the request enumerates items (comma-separated or numbered), create one task per item.',
+  'Never collapse an enumerated list into a single "complete all items" task.',
+  'Use draft_reply, post_reply, and edit_reply for the execution steps.',
+  'A multi-part request should have one task per part; a single-deliverable request should have no task steps.',
+  'Do not invent steps the assistant cannot perform. Use dependsOn to order steps.',
+  'Keep task descriptions short and concrete; keep execution descriptions brief.',
 ].join(' ')
 
 /** Parse the one supported tool call. Anything malformed becomes a deterministic fallback plan. */
@@ -160,7 +164,7 @@ export function parseTodoWriteCall(call: LlmToolCall): PlanStepInput[] | null {
   const args = call.arguments
   if (!args || typeof args !== 'object' || Array.isArray(args)) return null
   const rawSteps = (args as Record<string, unknown>).steps
-  if (!Array.isArray(rawSteps) || rawSteps.length === 0 || rawSteps.length > 5) return null
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0 || rawSteps.length > 30) return null
   const steps: PlanStepInput[] = []
   for (const raw of rawSteps) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null

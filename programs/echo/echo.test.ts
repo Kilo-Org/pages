@@ -61,8 +61,15 @@ function fakeLlm(decide: (prompt: string) => { respond: boolean; reply?: string 
  * if its own signal fires first) — so a test can have two overlapping calls in flight and
  * settle them independently, instead of one shared resolution affecting every call.
  */
+type DecisionValue = {
+  respond: boolean
+  reply?: string
+  completed?: boolean
+  completedTasks?: string[]
+}
+
 function deferredLlm() {
-  const pending: { resolve: (value: { respond: boolean; reply?: string }) => void }[] = []
+  const pending: { resolve: (value: DecisionValue) => void }[] = []
   let promptSeen: string | undefined
   const llm: LlmCapability = {
     complete: ({ prompt, signal }) => {
@@ -75,7 +82,8 @@ function deferredLlm() {
   }
   return {
     llm,
-    resolve: (value: { respond: boolean; reply?: string }, callIndex = pending.length - 1) => pending[callIndex]?.resolve(value),
+    resolve: (value: DecisionValue, callIndex = pending.length - 1) =>
+      pending[callIndex]?.resolve(value),
     get calls() {
       return pending.length
     },
@@ -480,7 +488,7 @@ describe('echo tick — speculative scheduling (Part A)', () => {
     await echo.tick!(ctx)
     await flush()
     expect(comments.posts.length).toBe(1) // no second thread
-    expect(comments.edits).toEqual([{ threadId: 'thread-1', messageId: 'message-1', body: 'Updated answer.', dedupeOn: 'Question two?' }])
+    expect(comments.edits).toEqual([{ threadId: 'thread-1', messageId: 'message-1', body: 'Updated answer.', dedupeOn: 'reply:Updated answer.' }])
   })
 })
 
@@ -614,7 +622,7 @@ describe('attempt() — commit fence, and first reply vs. correction (Part A fen
     await ctx.state.set('nodes/b1:0', base)
     await attempt('nodes/b1:0', base, ctx, new AbortController().signal)
     expect(comments.posts).toEqual([])
-    expect(comments.edits).toEqual([{ threadId: 'thread-1', messageId: 'message-1', body: 'Yes, definitely.', dedupeOn: 'Does it really work?' }])
+    expect(comments.edits).toEqual([{ threadId: 'thread-1', messageId: 'message-1', body: 'Yes, definitely.', dedupeOn: 'reply:Yes, definitely.' }])
     const saved = await savedTarget(ctx)
     expect(saved).toMatchObject({ lastReply: 'Yes, definitely.', threadId: 'thread-1', messageId: 'message-1' })
   })
@@ -995,7 +1003,8 @@ describe('plan steps — the to-do list behind an intent', () => {
         }
       },
     }
-    const { kv, ctx } = harness({ llm, comments: fakeComments() })
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
     await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
     await echo.tick!(ctx)
     await flush()
@@ -1005,9 +1014,293 @@ describe('plan steps — the to-do list behind an intent', () => {
     expect(room.steps[`${intentId}:1:draft`]?.description).toBe('Draft the tightened paragraph')
     expect(room.steps[`${intentId}:1:post`]?.description).toBe('Post the tightened paragraph')
     expect(calls.some((call) => call.system.includes('You plan the work'))).toBe(true)
+    expect(comments.posts[0]?.body).toBe('Done.')
   })
 
-  test('a plan the executor cannot run falls back to the executable plan', async () => {
+  test('a multi-part body action posts a visible plan, then checks it and adds the reply', async () => {
+    let resolveReply!: (value: DecisionValue) => void
+    const llm: LlmCapability = {
+      complete: () =>
+        new Promise<string>((resolve) => {
+          resolveReply = (value) => resolve(JSON.stringify(value))
+        }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: [
+                { key: 'vendors', kind: 'task', description: 'List the vendors' },
+                { key: 'teams', kind: 'task', description: 'Count the teams' },
+                { key: 'summary', kind: 'task', description: 'Suggest a one-line summary' },
+                {
+                  key: 'draft',
+                  kind: 'draft_reply',
+                  description: 'Draft the response',
+                  dependsOn: ['vendors', 'teams', 'summary'],
+                },
+                {
+                  key: 'post',
+                  kind: 'post_reply',
+                  description: 'Post the response',
+                  dependsOn: ['draft'],
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    }
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
+    await echo.handle(
+      event(1, [
+        node(
+          'updated',
+          'Please do these three things: 1) list the vendors, 2) count the teams, 3) suggest a one-line summary.',
+        ),
+      ]),
+      ctx,
+    )
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(comments.posts).toHaveLength(1)
+    expect(comments.posts[0]?.body).toContain('**Plan**')
+    expect(comments.posts[0]?.body).toContain('- [ ] List the vendors')
+    expect(comments.posts[0]?.body).toContain('- [ ] Count the teams')
+    expect(comments.posts[0]?.body).toContain('Working on it')
+    expect(comments.posts[0]?.dedupeOn.startsWith('plan:')).toBe(true)
+    expect(targetOf(kv)?.threadId).toBe('thread-1')
+
+    resolveReply({
+      respond: true,
+      reply: 'Vendors: Acme, Beta. Teams: three. Summary: the budget splits three ways.',
+      completedTasks: ['vendors', 'teams', 'summary'],
+    })
+    await flush()
+
+    expect(comments.edits).toHaveLength(1)
+    expect(comments.edits[0]?.body).toContain('- [x] List the vendors')
+    expect(comments.edits[0]?.body).toContain('- [x] Count the teams')
+    expect(comments.edits[0]?.body).toContain('Vendors: Acme, Beta.')
+    expect(comments.edits[0]?.dedupeOn.startsWith('reply:')).toBe(true)
+    expect(comments.posts).toHaveLength(1)
+    expect(targetOf(kv)?.lastReply).toBe('Vendors: Acme, Beta. Teams: three. Summary: the budget splits three ways.')
+  })
+
+  test('a multi-part action that asks for missing context leaves the checklist unchecked', async () => {
+    const llm: LlmCapability = {
+      complete: async () =>
+        JSON.stringify({
+          respond: true,
+          reply: 'I can help with all three, but I do not see the page content. Could you paste it?',
+        }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: [
+                { key: 'vendors', kind: 'task', description: 'List the vendors' },
+                { key: 'teams', kind: 'task', description: 'Count the teams' },
+                { key: 'summary', kind: 'task', description: 'Suggest a one-line summary' },
+                { key: 'draft', kind: 'draft_reply', description: 'Draft the response' },
+                {
+                  key: 'post',
+                  kind: 'post_reply',
+                  description: 'Post the response',
+                  dependsOn: ['draft'],
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    }
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
+    await echo.handle(
+      event(1, [
+        node(
+          'updated',
+          'Please do these three things: 1) list the vendors, 2) count the teams, 3) suggest a one-line summary.',
+        ),
+      ]),
+      ctx,
+    )
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(comments.edits).toHaveLength(1)
+    expect(comments.edits[0]?.body).toContain('- [ ] List the vendors')
+    expect(comments.edits[0]?.body).toContain('Could you paste it?')
+    const room = kv.room as RoomState
+    expect(Object.values(room.steps).some((step) => step.status !== 'done')).toBe(true)
+  })
+
+  test('a multi-part action checks only the tasks the reply finished', async () => {
+    const llm: LlmCapability = {
+      complete: async () =>
+        JSON.stringify({
+          respond: true,
+          reply:
+            'Vendors: Acme, Google, Meta, Twitter. Summary: Four vendors are listed for review. I cannot count teams without the teams paragraph.',
+          completed: false,
+          completedTasks: ['vendors', 'summary'],
+        }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: [
+                { key: 'vendors', kind: 'task', description: 'List the vendors' },
+                { key: 'teams', kind: 'task', description: 'Count the teams' },
+                { key: 'summary', kind: 'task', description: 'Suggest a one-line summary' },
+                { key: 'draft', kind: 'draft_reply', description: 'Draft the response' },
+                {
+                  key: 'post',
+                  kind: 'post_reply',
+                  description: 'Post the response',
+                  dependsOn: ['draft'],
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    }
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
+    await echo.handle(
+      event(1, [
+        node(
+          'updated',
+          'Please do these three things: 1) list the vendors, 2) count the teams, 3) suggest a one-line summary, acme, google, meta, twitter.',
+        ),
+      ]),
+      ctx,
+    )
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(comments.edits).toHaveLength(1)
+    expect(comments.edits[0]?.body).toContain('- [x] List the vendors')
+    expect(comments.edits[0]?.body).toContain('- [ ] Count the teams')
+    expect(comments.edits[0]?.body).toContain('- [x] Suggest a one-line summary')
+    const room = kv.room as RoomState
+    const intentId = Object.keys(room.intents)[0]!
+    expect(room.steps[`${intentId}:1:vendors`]?.status).toBe('done')
+    expect(room.steps[`${intentId}:1:teams`]?.status).not.toBe('done')
+    expect(room.steps[`${intentId}:1:summary`]?.status).toBe('done')
+    expect(room.steps[`${intentId}:1:draft`]?.status).toBe('done')
+  })
+
+  test('an enumerated list becomes one visible task per item', async () => {
+    const items = ['sleep', 'cook', 'eat', 'zumba', 'movies', 'travel', 'text', 'bike', 'run', 'walk', 'hair']
+    const llm: LlmCapability = {
+      complete: async () =>
+        JSON.stringify({
+          respond: true,
+          reply: 'All eleven are covered.',
+          completedTasks: items,
+        }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: items.map((item) => ({
+                key: item,
+                kind: 'task',
+                description: item[0]!.toUpperCase() + item.slice(1),
+              })),
+            },
+          },
+        ],
+      }),
+    }
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
+    await echo.handle(
+      event(1, [
+        node(
+          'updated',
+          'Please do ten things, sleep, cook, eat, zumba, movies, travel, text, bike, run, walk, hair',
+        ),
+      ]),
+      ctx,
+    )
+    backdate(kv, 'nodes/b1:0', 10_000)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(comments.posts).toHaveLength(1)
+    expect(comments.posts[0]?.body).toContain('- [ ] Sleep')
+    expect(comments.posts[0]?.body).toContain('- [ ] Hair')
+    expect(comments.edits).toHaveLength(1)
+    expect(comments.edits[0]?.body).toContain('- [x] Sleep')
+    expect(comments.edits[0]?.body).toContain('- [x] Hair')
+    const room = kv.room as RoomState
+    const intentId = Object.keys(room.intents)[0]!
+    expect(Object.values(room.steps).filter((step) => step.kind === 'task')).toHaveLength(11)
+    expect(Object.values(room.steps).every((step) => step.status === 'done')).toBe(true)
+  })
+
+  test('a multi-part comment action includes the checked plan in its reply', async () => {
+    const llm: LlmCapability = {
+      complete: async () =>
+        JSON.stringify({
+          respond: true,
+          reply: 'Acme and Beta; three teams.',
+          completedTasks: ['vendors', 'teams'],
+        }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: [
+                { key: 'vendors', kind: 'task', description: 'List the vendors' },
+                { key: 'teams', kind: 'task', description: 'Count the teams' },
+                { key: 'draft', kind: 'draft_reply', description: 'Draft the reply' },
+                {
+                  key: 'post',
+                  kind: 'post_reply',
+                  description: 'Post the reply',
+                  dependsOn: ['draft'],
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    }
+    const comments = fakeComments()
+    const { ctx } = harness({ llm, comments })
+    await echo.handle(
+      event(1, [commentChange({ body: 'Please do two things: list the vendors and count the teams.' })]),
+      ctx,
+    )
+
+    expect(comments.replies).toHaveLength(1)
+    expect(comments.replies[0]?.body).toContain('**Plan**')
+    expect(comments.replies[0]?.body).toContain('- [x] List the vendors')
+    expect(comments.replies[0]?.body).toContain('Acme and Beta; three teams.')
+  })
+
+  test('a plan that uses edit_reply without a reply is normalized to post_reply', async () => {
     const llm: LlmCapability = {
       complete: async () => JSON.stringify({ respond: true, reply: 'Done.' }),
       completeWithTools: async () => ({
@@ -1023,15 +1316,66 @@ describe('plan steps — the to-do list behind an intent', () => {
         ],
       }),
     }
-    const { kv, ctx, lines } = harness({ llm, comments: fakeComments() })
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
     await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
     await echo.tick!(ctx)
     await flush()
 
     const room = kv.room as RoomState
     const intentId = Object.keys(room.intents)[0]!
-    expect(room.steps[`${intentId}:1:draft`]).toMatchObject({ kind: 'draft_reply', status: 'done' })
-    expect(room.steps[`${intentId}:1:post`]).toMatchObject({ kind: 'post_reply', status: 'done' })
-    expect(lines.some((line) => line.includes('no executable plan'))).toBe(true)
+    expect(room.steps[`${intentId}:1:edit`]).toMatchObject({ kind: 'post_reply', status: 'done' })
+    expect(comments.posts).toHaveLength(1)
+    expect(comments.edits).toEqual([])
+  })
+
+  test('a plan that posts when a reply already exists is normalized to edit_reply', async () => {
+    const llm: LlmCapability = {
+      complete: async ({ prompt }) =>
+        JSON.stringify({
+          respond: true,
+          reply: prompt.includes('add a summary') ? 'Updated summary.' : 'First answer.',
+        }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: [
+                { key: 'vendors', kind: 'task', description: 'List the vendors' },
+                { key: 'draft', kind: 'draft_reply', description: 'Draft the reply' },
+                {
+                  key: 'post',
+                  kind: 'post_reply',
+                  description: 'Post the reply',
+                  dependsOn: ['draft'],
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    }
+    const comments = fakeComments()
+    const { kv, ctx } = harness({ llm, comments })
+    await echo.handle(event(1, [node('updated', 'Please tighten this paragraph.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+    expect(comments.posts).toHaveLength(1)
+
+    await echo.handle(event(2, [node('updated', 'Please tighten this paragraph and add a summary.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    const room = kv.room as RoomState
+    const intentId = Object.keys(room.intents)[0]!
+    expect(room.intents[intentId]?.version).toBe(2)
+    expect(room.steps[`${intentId}:2:post`]).toMatchObject({ kind: 'edit_reply', status: 'done' })
+    expect(comments.edits.some((edit) => edit.dedupeOn.startsWith('plan:'))).toBe(true)
+    expect(comments.edits.at(-1)?.dedupeOn.startsWith('reply:')).toBe(true)
+    expect(comments.edits.at(-1)?.body).toContain('Updated summary.')
+    expect(comments.posts).toHaveLength(1)
   })
 })

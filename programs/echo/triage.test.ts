@@ -176,7 +176,8 @@ describe('todo_write planning', () => {
       name: 'todo_write',
       arguments: {
         steps: [
-          { key: 'draft', kind: 'draft_reply', description: 'Draft the summary' },
+          { key: 'summary', kind: 'task', description: 'Summarize the budget' },
+          { key: 'draft', kind: 'draft_reply', description: 'Draft the summary', dependsOn: ['summary'] },
           {
             key: 'post',
             kind: 'post_reply',
@@ -187,7 +188,8 @@ describe('todo_write planning', () => {
       },
     })
     expect(steps).toEqual([
-      { key: 'draft', kind: 'draft_reply', description: 'Draft the summary' },
+      { key: 'summary', kind: 'task', description: 'Summarize the budget' },
+      { key: 'draft', kind: 'draft_reply', description: 'Draft the summary', dependsOn: ['summary'] },
       {
         key: 'post',
         kind: 'post_reply',
@@ -227,7 +229,10 @@ describe('todo_write planning', () => {
   test('the tool and prompt describe only executable step kinds', () => {
     expect(TODO_WRITE_TOOL.name).toBe('todo_write')
     expect(JSON.stringify(TODO_WRITE_TOOL.parameters)).toContain('draft_reply')
+    expect(PLAN_SYSTEM_PROMPT).toContain('task')
+    expect(PLAN_SYSTEM_PROMPT).toContain('one task per item')
     expect(PLAN_SYSTEM_PROMPT).toContain('draft_reply')
     expect(PLAN_SYSTEM_PROMPT).not.toContain('read_context')
+    expect(JSON.stringify(TODO_WRITE_TOOL.parameters)).toContain('"maxItems":30')
   })
 })

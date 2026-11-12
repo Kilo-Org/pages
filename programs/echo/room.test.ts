@@ -51,6 +51,7 @@ const target = (overrides: Partial<TargetState> = {}): TargetState => ({
 
 const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
   id: 's1',
+  key: 's1',
   intentId: 'intent',
   intentVersion: 1,
   status: 'pending',
@@ -360,6 +361,35 @@ describe('plan steps', () => {
     expect(stepsForVersion(bumped.room, intentId, 2)).toEqual([])
   })
 
+  test('a new body node does not reuse a different node intent in the same block', () => {
+    const first = applyTriage(
+      emptyRoom('p'),
+      {
+        intentId: null,
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:0' },
+        confidence: 1,
+        evidence: { eventId: 'e1', at },
+      },
+      at,
+      false,
+    )
+    const second = applyTriage(
+      first.room,
+      {
+        intentId: null,
+        kind: 'action',
+        targetScope: { pageId: 'p', blockId: 'b1', nodeKey: 'nodes/b1:1' },
+        confidence: 1,
+        evidence: { eventId: 'e2', at },
+      },
+      at,
+      false,
+    )
+    expect(second.intent?.targetScope.nodeKey).toBe('nodes/b1:1')
+    expect(Object.keys(second.room.intents)).toHaveLength(2)
+  })
+
   test('planIntent creates ordered steps with dependencies and nextStep picks the first', () => {
     const admitted = applyTriage(
       emptyRoom('p'),
@@ -401,13 +431,13 @@ describe('plan steps', () => {
     ).toContain('cycle')
     expect(
       validatePlanSteps(
-        Array.from({ length: 6 }, (_, i) => ({
+        Array.from({ length: 31 }, (_, i) => ({
           key: `s${i}`,
           kind: 'draft_reply' as const,
           description: 'x',
         })),
       ),
-    ).toContain('five')
+    ).toContain('thirty')
   })
 
   test('planIntent rejects a stale version and does not overwrite executed work', () => {

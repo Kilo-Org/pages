@@ -87,6 +87,7 @@ async function loadRoom(ctx: ProgramContext, pageId = ''): Promise<RoomState> {
         id,
         {
           ...step,
+          key: step.key ?? id.split(':').pop() ?? id,
           kind: step.kind ?? null,
           position: typeof step.position === 'number' ? step.position : index,
         },
@@ -162,21 +163,27 @@ const ANSWER_SYSTEM_PROMPT = [
   'You are answering a question or request on a collaborative page.',
   'Triage already decided the text needs a reply, so do not stay silent.',
   'Answer it directly in 1-3 sentences. If it is too vague to answer, ask one short clarifying question.',
-  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string}.',
+  'Set "completed" false when you are asking for missing context or could not finish the request; otherwise true.',
+  'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string, "completed": boolean, "completedTasks": string[]}.',
 ].join(' ')
 
 const COMMENT_SYSTEM_PROMPT = [
   'You are answering a message in one comment thread on a collaborative page.',
   'Triage already decided the message needs a reply, so do not stay silent.',
   'Answer it, or ask one short clarifying question if it is too vague.',
-  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string}.',
+  'Set "completed" false when you are asking for missing context or could not finish the request; otherwise true.',
+  'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string, "completed": boolean, "completedTasks": string[]}.',
 ].join(' ')
 
 const CORRECTION_SYSTEM_PROMPT = [
   'You are handling a correction to text on a collaborative page.',
   'Use the previous text and the correction to work out what should change.',
   'If the correction is still too vague to act on, ask one short, specific question.',
-  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string}.',
+  'Set "completed" false when you are asking for missing context or could not finish the change; otherwise true.',
+  'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": true, "reply": string, "completed": boolean, "completedTasks": string[]}.',
 ].join(' ')
 
 const CLARIFY_SYSTEM_PROMPT = [
@@ -189,10 +196,12 @@ const FOLLOWUP_SYSTEM_PROMPT = [
   'The change may be a correction, a refinement, unrelated new content, or nothing worth updating your reply for.',
   'If you update it, write the FULL replacement reply text: it wholly replaces your previous reply, it does not append to it.',
   'Stay silent (respond: false) if your existing reply still stands and nothing material changed.',
-  'Respond with strict JSON only, no prose, no code fences: {"respond": boolean, "reply": string or null}.',
+  'Set "completed" false when you are asking for missing context or could not finish the change; otherwise true.',
+  'When Plan tasks are provided, "completedTasks" lists the keys you finished; use [] for none.',
+  'Respond with strict JSON only, no prose, no code fences: {"respond": boolean, "reply": string or null, "completed": boolean, "completedTasks": string[]}.',
 ].join(' ')
 
-type Decision = { respond: boolean; reply?: string }
+type Decision = { respond: boolean; reply?: string; completed?: boolean; completedTasks?: string[] }
 
 function parseDecision(raw: string): Decision {
   const cleaned = raw
@@ -204,9 +213,21 @@ function parseDecision(raw: string): Decision {
   if (typeof parsed !== 'object' || parsed === null || !('respond' in parsed)) {
     throw new Error(`malformed decision: ${cleaned.slice(0, 200)}`)
   }
-  const { respond, reply } = parsed as { respond: unknown; reply?: unknown }
+  const { respond, reply, completed, completedTasks } = parsed as {
+    respond: unknown
+    reply?: unknown
+    completed?: unknown
+    completedTasks?: unknown
+  }
   if (typeof respond !== 'boolean') throw new Error(`malformed decision: ${cleaned.slice(0, 200)}`)
-  return { respond, reply: typeof reply === 'string' && reply.trim() ? reply.trim() : undefined }
+  return {
+    respond,
+    reply: typeof reply === 'string' && reply.trim() ? reply.trim() : undefined,
+    ...(typeof completed === 'boolean' ? { completed } : {}),
+    ...(Array.isArray(completedTasks) && completedTasks.every((key) => typeof key === 'string')
+      ? { completedTasks }
+      : {}),
+  }
 }
 
 type SpeculativeAttempt = { baseText: string; controller: AbortController }
@@ -310,19 +331,16 @@ async function proposePlan(
     })
     const call = result.toolCalls.find((candidate) => candidate.name === 'todo_write')
     const parsed = call ? parseTodoWriteCall(call) : null
-    const executable =
-      parsed?.every((step) =>
-        step.kind === 'edit_reply'
-          ? input.surface === 'body' && input.hasReply
-          : step.kind === 'post_reply'
-            ? input.surface === 'comment' || !input.hasReply
-            : true,
-      ) ?? false
-    if (!parsed || !executable) {
-      ctx.log('todo_write returned no executable plan; using the fallback plan')
+    if (!parsed) {
+      ctx.log('todo_write returned no usable plan; using the fallback plan')
       return null
     }
-    return parsed
+    const canEdit = input.surface === 'body' && input.hasReply
+    return parsed.map((step) => {
+      if (step.kind === 'edit_reply' && !canEdit) return { ...step, kind: 'post_reply' as const }
+      if (step.kind === 'post_reply' && canEdit) return { ...step, kind: 'edit_reply' as const }
+      return step
+    })
   } catch (error) {
     if (isAbortError(error)) throw error
     const message = error instanceof Error ? error.message : String(error)
@@ -340,6 +358,81 @@ function installPlan(
   const planned = planIntent(room, intent.id, intent.version, steps)
   const step = nextStep(planned, intent.id)
   return step ? activateStep(planned, step.id) : planned
+}
+
+const visibleTasks = (room: RoomState, intentId: string): PlanStep[] => {
+  const intent = room.intents[intentId]
+  return intent
+    ? stepsForVersion(room, intentId, intent.version).filter((step) => step.kind === 'task')
+    : []
+}
+
+/** The task keys the model says it finished, with a conservative fallback. */
+function completedTaskKeys(
+  tasks: { key: string }[],
+  decision: Decision,
+): Set<string> {
+  const keys = new Set(tasks.map((task) => task.key))
+  const explicit = decision.completedTasks?.filter((key) => keys.has(key))
+  if (explicit) return new Set(explicit)
+  if (decision.completed === false) return new Set()
+  if (tasks.length > 0 && /\?\s*$/.test(decision.reply ?? '')) return new Set()
+  return keys
+}
+
+/** Renders the user-facing checklist, checking only tasks the model finished. */
+function checklist(
+  tasks: { key: string; description: string }[],
+  done: ReadonlySet<string>,
+  reply?: string,
+): string {
+  const lines = tasks.map((task) => `- [${done.has(task.key) ? 'x' : ' '}] ${task.description.trim()}`)
+  const plan = `**Plan**\n${lines.join('\n')}`
+  return reply ? `${plan}\n\n${reply}` : `${plan}\n\nWorking on it…`
+}
+
+/**
+ * Shows the unchecked plan while the model drafts. The final commit edits the
+ * same message, so a multi-part request has one visible checklist that becomes
+ * the checked list plus the answer.
+ */
+async function showDraft(
+  ctx: ProgramContext,
+  pageId: string,
+  key: string,
+  base: TargetState,
+  tasks: PlanStep[],
+): Promise<void> {
+  if (tasks.length === 0) return
+  await updateRoom(ctx, pageId, async (room) => {
+    const target = room.targets[key]
+    if (!target || target.text !== base.text || target.generation !== base.generation) {
+      return { room, value: undefined }
+    }
+    const body = checklist(tasks, new Set())
+    if (target.threadId && target.messageId) {
+      await ctx.comments!.editMessage({
+        threadId: target.threadId,
+        messageId: target.messageId,
+        body,
+        dedupeOn: `plan:${body}`,
+      })
+      return { room, value: undefined }
+    }
+    const posted = await ctx.comments!.addBlock({
+      blockId: target.blockId,
+      body,
+      dedupeOn: `plan:${body}`,
+    })
+    return {
+      room: recordTarget(room, {
+        ...target,
+        threadId: posted.threadId,
+        messageId: posted.messageId,
+      }),
+      value: undefined,
+    }
+  })
 }
 
 function isAbortError(error: unknown): boolean {
@@ -464,6 +557,7 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
     const plansIntent =
       applied.intent !== undefined &&
       (triage.outcome === 'new_action' || triage.outcome === 'correction')
+    let taskContext: string | null = null
     if (plansIntent) {
       const current = applied.intent!
       let planned = false
@@ -500,6 +594,12 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
           return { room: step ? activateStep(room, step.id) : room, value: undefined }
         })
       }
+      const planRoom = await loadRoom(ctx, base.pageId)
+      const tasks = visibleTasks(planRoom, current.id)
+      taskContext = tasks.length
+        ? `Plan tasks (keys):\n${tasks.map((task) => `${task.key}: ${task.description}`).join('\n')}`
+        : null
+      if (tasks.length > 0) await showDraft(ctx, base.pageId, key, base, tasks)
     }
     const system =
       triage.outcome === 'clarify'
@@ -510,6 +610,7 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
             : CORRECTION_SYSTEM_PROMPT
           : ANSWER_SYSTEM_PROMPT
     const promptParts: string[] = []
+    if (taskContext) promptParts.push(taskContext)
     if (triage.outcome === 'correction' && base.previousText)
       promptParts.push(`Previous text: ${JSON.stringify(base.previousText)}`)
     if (hasReply) promptParts.push(`Previous reply: ${JSON.stringify(base.lastReply)}`)
@@ -529,13 +630,23 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         generation: base.generation,
       })
       if (!fresh || !current) return { room, value: 'discarded' as const }
+      const intentId = applied.intent?.id
+      const tasks = intentId ? visibleTasks(room, intentId) : []
+      const doneKeys = completedTaskKeys(tasks, decision)
       let { threadId, messageId, lastReply } = fresh
       if (decision.respond && decision.reply) {
+        const body =
+          tasks.length > 0 ? checklist(tasks, doneKeys, decision.reply) : decision.reply
         if (threadId && messageId) {
-          await ctx.comments!.editMessage({ threadId, messageId, body: decision.reply, dedupeOn: fresh.text })
+          await ctx.comments!.editMessage({
+            threadId,
+            messageId,
+            body,
+            dedupeOn: `reply:${body}`,
+          })
           ctx.log(`updated reply in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
         } else {
-          const posted = await ctx.comments!.addBlock({ blockId: fresh.blockId, body: decision.reply, dedupeOn: fresh.text })
+          const posted = await ctx.comments!.addBlock({ blockId: fresh.blockId, body, dedupeOn: fresh.text })
           threadId = posted.threadId
           messageId = posted.messageId
           ctx.log(`replied in thread ${threadId.slice(0, 8)}: ${JSON.stringify(decision.reply)}`)
@@ -551,13 +662,9 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
         messageId,
         lastReply,
       })
-      const intentId = applied.intent?.id
       if (intentId && threadId) nextRoom = attachThreadToIntent(nextRoom, intentId, threadId)
-      if (plansIntent && intentId) {
-        nextRoom =
-          decision.respond && decision.reply
-            ? completePlan(nextRoom, intentId)
-            : cancelPlan(nextRoom, intentId)
+      if (plansIntent && intentId && decision.respond && decision.reply) {
+        nextRoom = completePlan(nextRoom, intentId, doneKeys)
       }
       return { room: nextRoom, value: 'written' as const }
     })
@@ -651,9 +758,13 @@ async function handleComment(
     evidence: { eventId, at, messageId: change.messageId! },
   }
 
+  const commentTasks = (proposal ?? []).filter((step) => step.kind === 'task')
+  const taskLines = commentTasks
+    .map((task) => `${task.key}: ${task.description}`)
+    .join('\n')
   const raw = await ctx.llm!.complete({
     system: triage.outcome === 'clarify' ? CLARIFY_SYSTEM_PROMPT : COMMENT_SYSTEM_PROMPT,
-    prompt: `Thread ${change.threadId}\nComment: ${change.body ?? ''}`,
+    prompt: `Thread ${change.threadId}\nComment: ${change.body ?? ''}${taskLines ? `\n\nPlan tasks (keys):\n${taskLines}` : ''}`,
   })
   const decision = parseDecision(raw)
   if (!decision.respond || !decision.reply) {
@@ -691,15 +802,19 @@ async function handleComment(
       const step = nextStep(next, intent.id)
       if (step) next = activateStep(next, step.id)
     }
+    const tasks = (proposal ?? []).filter((step) => step.kind === 'task')
+    const doneKeys = completedTaskKeys(tasks, decision)
+    const body =
+      tasks.length > 0 ? checklist(tasks, doneKeys, decision.reply!) : decision.reply!
     await ctx.comments!.replyToThread({
       threadId: change.threadId,
-      body: decision.reply!,
+      body,
       dedupeOn: handleKey,
     })
     next = markCommentHandled(next, change.threadId, handleKey)
     if (intent) {
       next = attachThreadToIntent(next, intent.id, change.threadId)
-      if (plansIntent) next = completePlan(next, intent.id)
+      if (plansIntent) next = completePlan(next, intent.id, doneKeys)
     }
     return { room: next, value: 'posted' as const }
   })
