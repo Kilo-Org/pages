@@ -262,3 +262,16 @@ up for API-credentialed hosts (an API key or MCP OAuth) — a host signed in
 the way a browser is (the local-dev default, no `PAGES_TOKEN`) publishes
 nothing, same as a person's own editor never shows their own caret back to
 them.
+
+Because that caret is invisible in local development, `attempt()` also
+publishes a working indicator through `report_page_progress`
+(`ctx.progress`, `packages/pages/src/progress.ts`). It is a short-lived lease,
+not page state: `Thinking about this paragraph…` when deciding, then
+`Planning this request…`, `Updating my reply…`, or `Working through N tasks…`
+once triage and the plan are known. The lease is renewed every 25 seconds for
+slow generations and cleared when the attempt commits, is aborted, or fails.
+An anchored report needs a scoped `read_page` for heads and a uniquely
+matching passage; if either is unavailable it falls back to a message-only
+indicator. Unlike the reading caret, this works for every credential kind,
+including a browser-session login, so it is the indicator local developers
+actually see.

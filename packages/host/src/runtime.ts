@@ -4,8 +4,10 @@
 import type { PagesClient } from '@pages-programs/pages'
 import {
   addBlockComment,
+  clearProgress,
   editComment,
   emptySelectionCursor,
+  reportProgress,
   replyToComment,
   openCursor,
   pollPage,
@@ -89,6 +91,10 @@ export async function runProgram(options: RunOptions): Promise<void> {
     },
     presence: {
       showReading: (blockId) => showReadingPresence(client, { pageId, blockId }),
+    },
+    progress: {
+      report: (input) => reportProgress(client, { pageId, ...input }),
+      clear: (input) => clearProgress(client, { pageId, ...input }),
     },
   }
 

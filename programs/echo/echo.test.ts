@@ -9,10 +9,16 @@ import type {
   PageChange,
   PageChangedEvent,
   PresenceCapability,
+  ProgressCapability,
   ProgramContext,
 } from '@pages-programs/sdk'
 
-function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability; presence?: PresenceCapability }) {
+function harness(extra?: {
+  llm?: LlmCapability
+  comments?: CommentsCapability
+  presence?: PresenceCapability
+  progress?: ProgressCapability
+}) {
   const lines: string[] = []
   const kv: Record<string, unknown> = {}
   const scratch = new Map<string, unknown>()
@@ -33,8 +39,26 @@ function harness(extra?: { llm?: LlmCapability; comments?: CommentsCapability; p
     llm: extra?.llm,
     comments: extra?.comments,
     presence: extra?.presence,
+    progress: extra?.progress,
   }
   return { lines, kv, scratch, ctx }
+}
+
+function fakeProgress(): ProgressCapability & {
+  reports: Parameters<ProgressCapability['report']>[0][]
+  clears: Parameters<ProgressCapability['clear']>[0][]
+} {
+  const reports: Parameters<ProgressCapability['report']>[0][] = []
+  const clears: Parameters<ProgressCapability['clear']>[0][] = []
+  return {
+    reports,
+    clears,
+    report: async (input) => {
+      reports.push(input)
+      return { progressId: 'pid', leaseToken: reports.length === 1 ? 'lease' : null }
+    },
+    clear: async (input) => void clears.push(input),
+  }
 }
 
 function fakePresence(): PresenceCapability & { shown: string[] } {
@@ -1518,5 +1542,75 @@ describe('failure fencing and thread lifecycle', () => {
     expect(room.pageId).toBe('p')
     expect(room.targets['nodes/b1:0']?.pageId).toBe('p')
     expect(comments.posts).toHaveLength(1)
+  })
+})
+
+describe('working indicator', () => {
+  test('a body attempt publishes the work and clears it after the reply', async () => {
+    const progress = fakeProgress()
+    const spy = scriptedLlm(() => ({ reply: 'Yes, it works.' }))
+    const { ctx } = harness({ llm: spy.llm, comments: fakeComments(), progress })
+    await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(progress.reports[0]).toMatchObject({
+      message: 'Thinking about this paragraph…',
+      blockId: 'b1',
+      matchText: 'Does it work?',
+    })
+    expect(progress.reports.at(-1)?.message).toBe('Answering this…')
+    expect(progress.clears).toEqual([{ progressId: 'pid', leaseToken: 'lease' }])
+  })
+
+  test('a multi-part action shows the task count, then clears', async () => {
+    const progress = fakeProgress()
+    const llm: LlmCapability = {
+      complete: async () => JSON.stringify({ reply: 'Done.' }),
+      completeWithTools: async () => ({
+        content: null,
+        toolCalls: [
+          {
+            id: 'call_1',
+            name: 'todo_write',
+            arguments: {
+              steps: [
+                { key: 'a', kind: 'task', description: 'List vendors' },
+                { key: 'b', kind: 'task', description: 'Count teams' },
+                { key: 'c', kind: 'task', description: 'Summarize' },
+              ],
+            },
+          },
+        ],
+      }),
+    }
+    const { ctx } = harness({ llm, comments: fakeComments(), progress })
+    await echo.handle(event(1, [node('updated', 'Please list vendors, count teams, and summarize.')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(progress.reports.some((report) => report.message === 'Working through 3 tasks…')).toBe(true)
+    expect(progress.clears).toHaveLength(1)
+  })
+
+  test('a failed attempt still clears the indicator', async () => {
+    const progress = fakeProgress()
+    const llm = fakeLlm(() => new Error('gateway down'))
+    const { ctx } = harness({ llm, comments: fakeComments(), progress })
+    await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+
+    expect(progress.reports.length).toBeGreaterThan(0)
+    expect(progress.clears).toHaveLength(1)
+  })
+
+  test('no progress capability is a no-op', async () => {
+    const spy = scriptedLlm(() => ({ reply: 'Yes.' }))
+    const { ctx } = harness({ llm: spy.llm, comments: fakeComments() })
+    await echo.handle(event(1, [node('updated', 'Does it work?')]), ctx)
+    await echo.tick!(ctx)
+    await flush()
+    expect(spy.calls.length).toBeGreaterThan(0)
   })
 })
