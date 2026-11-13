@@ -63,7 +63,11 @@ if (command === 'list') {
   const origin = values.origin ?? process.env.PAGES_ORIGIN ?? fleet.origin ?? DEFAULT_ORIGIN
   const intervalMs = Number(values.interval ?? fleet.intervalMs ?? DEFAULT_INTERVAL_MS)
   const token = process.env.PAGES_TOKEN
-  const client = createPagesClient({ origin, auth: token ? bearerAuth(token) : localOidcAuth(origin) })
+  const client = createPagesClient({
+    origin,
+    auth: token ? bearerAuth(token) : localOidcAuth(origin),
+    driver: 'Kilo',
+  })
   const kiloApiKey = process.env.KILO_API_KEY
   const llm = kiloApiKey
     ? createKiloLlm({ apiKey: kiloApiKey, model: process.env.KILO_MODEL ?? DEFAULT_KILO_MODEL, orgId: process.env.KILO_ORG_ID })

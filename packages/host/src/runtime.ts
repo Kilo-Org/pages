@@ -4,8 +4,10 @@
 import type { PagesClient } from '@pages-programs/pages'
 import {
   addBlockComment,
+  clearProgress,
   editComment,
   emptySelectionCursor,
+  reportProgress,
   replyToComment,
   openCursor,
   pollPage,
@@ -112,6 +114,10 @@ export async function runProgram(options: RunOptions): Promise<void> {
         return ownPrincipal ? page : { ...page, presence: [] }
       },
       comments: (input) => readComments(client, pageId, input, { ownPrincipal }),
+    },
+    progress: {
+      report: (input) => reportProgress(client, { pageId, ...input }),
+      clear: (input) => clearProgress(client, { pageId, ...input }),
     },
   }
 

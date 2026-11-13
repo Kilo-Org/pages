@@ -12,6 +12,8 @@ export type PagesClientOptions = {
   origin: string
   auth: PagesAuth
   fetch?: typeof fetch
+  /** Sent as `x-pages-driver`; labels progress and presence as this agent. */
+  driver?: string
 }
 
 export class PagesError extends Error {
@@ -62,7 +64,12 @@ export function createPagesClient(options: PagesClientOptions) {
   ): Promise<Response> {
     return doFetch(`${origin}/api/tools`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', origin, ...(await options.auth.headers()) },
+      headers: {
+        'content-type': 'application/json',
+        origin,
+        ...(options.driver ? { 'x-pages-driver': options.driver } : {}),
+        ...(await options.auth.headers()),
+      },
       body: JSON.stringify({ operation, arguments: args }),
       ...(signal ? { signal } : {}),
     })
@@ -104,7 +111,11 @@ export function createPagesClient(options: PagesClientOptions) {
     const get = async () =>
       doFetch(`${origin}/whoami`, {
         method: 'GET',
-        headers: { origin, ...(await options.auth.headers()) },
+        headers: {
+          origin,
+          ...(options.driver ? { 'x-pages-driver': options.driver } : {}),
+          ...(await options.auth.headers()),
+        },
       })
     let response = await get()
     if (response.status === 401 && options.auth.refresh && (await options.auth.refresh())) {

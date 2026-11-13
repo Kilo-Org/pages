@@ -268,6 +268,28 @@ export type PresenceCapability = {
   showReading(blockId: string): Promise<void>
 }
 
+/**
+ * A UX hint only: publishes a short-lived "working on this" indicator, so a
+ * person sees the agent is busy before any reply is ready — not a
+ * correctness-bearing write. Works for browser-session credentials too, where
+ * the reading caret is suppressed. Safe to ignore on failure.
+ */
+export type ProgressCapability = {
+  /**
+   * Starts or renews a lease. Pass `progressId`/`leaseToken` from a previous
+   * report to renew instead of starting a second indicator.
+   */
+  report(input: {
+    message: string
+    blockId?: string
+    matchText?: string
+    progressId?: string
+    leaseToken?: string
+  }): Promise<{ progressId: string; leaseToken: string | null }>
+  /** Clears a lease. An expired lease is already gone, so this is safe to skip. */
+  clear(input: { progressId: string; leaseToken: string }): Promise<void>
+}
+
 export type ProgramContext = {
   /** The page this instance is watching. */
   pageId?: string
@@ -282,6 +304,7 @@ export type ProgramContext = {
   presence?: PresenceCapability
   /** Present when the host can read page content and comments for context. */
   reads?: ReadsCapability
+  progress?: ProgressCapability
 }
 
 export type Program = {

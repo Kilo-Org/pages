@@ -561,6 +561,109 @@ const looksComplete = (text: string) => /[?.!][\s*_~`)\]}"'”’]*$/.test(text.
 const backoffFor = (failures: number) =>
   failures === 0 ? 0 : Math.min(SPECULATIVE_PAUSE_MS * 2 ** Math.min(failures - 1, 10), MAX_BACKOFF_MS)
 
+const workingMessage = (outcome: Triage['outcome']) =>
+  outcome === 'correction'
+    ? 'Updating my reply…'
+    : outcome === 'new_action'
+      ? 'Planning this request…'
+      : outcome === 'clarify'
+        ? 'Working out what you need…'
+        : 'Answering this…'
+
+/** How often a long generation renews its progress lease (the host TTL is 60s). */
+const PROGRESS_RENEW_MS = 25_000
+/** A UX hint must never hold up the model call for longer than this. */
+const PROGRESS_START_TIMEOUT_MS = 750
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms)
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      () => {
+        clearTimeout(timer)
+        resolve(null)
+      },
+    )
+  })
+}
+
+type WorkingIndicator = {
+  progressId: string
+  leaseToken: string
+  message: string
+  timer: ReturnType<typeof setInterval> | null
+}
+
+/**
+ * Publishes "this paragraph is being worked on" before the model call. This is
+ * the only indicator that shows for a local browser-session login, where the
+ * reading caret is suppressed. Never throws: it is a UX hint, not state.
+ */
+async function beginWorking(ctx: ProgramContext, base: TargetState): Promise<WorkingIndicator | null> {
+  if (!ctx.progress) return null
+  const message = 'Thinking about this paragraph…'
+  try {
+    const handle = await ctx.progress.report({
+      message,
+      blockId: base.blockId,
+      matchText: base.text,
+    })
+    if (!handle.leaseToken) return null
+    const working: WorkingIndicator = {
+      progressId: handle.progressId,
+      leaseToken: handle.leaseToken,
+      message,
+      timer: null,
+    }
+    // Keep the lease alive across a slow planner + answer without a second timer story.
+    working.timer = setInterval(() => {
+      void ctx.progress
+        ?.report({
+          message: working.message,
+          progressId: working.progressId,
+          leaseToken: working.leaseToken,
+        })
+        .catch(() => {})
+    }, PROGRESS_RENEW_MS)
+    ;(working.timer as unknown as { unref?: () => void }).unref?.()
+    return working
+  } catch {
+    return null
+  }
+}
+
+/** Updates the indicator text in place; a revision of the same lease, not a new one. */
+async function updateWorking(
+  ctx: ProgramContext,
+  working: WorkingIndicator | null,
+  message: string,
+): Promise<void> {
+  if (!working || working.message === message) return
+  working.message = message
+  // Fire-and-forget: a UX hint must never hold up the plan or the model call.
+  void ctx.progress
+    ?.report({
+      message,
+      progressId: working.progressId,
+      leaseToken: working.leaseToken,
+    })
+    .catch(() => {})
+}
+
+async function endWorking(ctx: ProgramContext, working: WorkingIndicator | null): Promise<void> {
+  if (!working) return
+  if (working.timer) clearInterval(working.timer)
+  // Fire-and-forget: the lease expires on its own if this never lands.
+  void ctx.progress
+    ?.clear({ progressId: working.progressId, leaseToken: working.leaseToken })
+    .catch(() => {})
+}
+
 /**
  * The speculative attempt: decide, then commit only if the text, generation,
  * and intent version it was based on still match. The commit check runs inside
@@ -568,9 +671,15 @@ const backoffFor = (failures: number) =>
  */
 async function attempt(key: string, base: TargetState, ctx: ProgramContext, signal: AbortSignal): Promise<void> {
   if (!base.text.trim()) return
-  // Best-effort UX hint: a reading caret can show up well before the model call
-  // resolves. Never let this delay or fail the actual attempt.
+  // Best-effort UX hints: a reading caret and a "working" indicator can show up
+  // well before the model call resolves. Neither may delay or fail the attempt.
   void ctx.presence?.showReading(base.blockId).catch(() => {})
+  const pendingWorking = beginWorking(ctx, base)
+  const working = await withTimeout(pendingWorking, PROGRESS_START_TIMEOUT_MS)
+  if (!working) {
+    // A late lease has nobody to clear it, so clear it as soon as it resolves.
+    void pendingWorking.then((late) => (late ? endWorking(ctx, late) : undefined)).catch(() => {})
+  }
   try {
     const snapshot = await loadRoom(ctx, base.pageId)
     const verdict = triageBody(base.text, snapshot, key)
@@ -585,6 +694,7 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       base.previousText,
     )
     ctx.log(`triage ${base.blockId.slice(0, 8)}: ${triage.outcome} (${triage.source}) ${triage.reason}`)
+    await updateWorking(ctx, working, workingMessage(triage.outcome))
     const now = new Date().toISOString()
     const applied = await updateRoom(ctx, base.pageId, (room) => {
       const result = applyTriage(
@@ -742,7 +852,10 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       now: contextNow,
     })
     ctx.log(`context body ${base.blockId.slice(0, 8)} ${describeContext(assembled)}`)
-    if (tasks.length > 0) await showDraft(ctx, base.pageId, key, base, tasks)
+    if (tasks.length > 0) {
+      await updateWorking(ctx, working, `Working through ${tasks.length} tasks…`)
+      await showDraft(ctx, base.pageId, key, base, tasks)
+    }
 
     const system =
       triage.outcome === 'clarify'
@@ -875,6 +988,8 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       }
     })
     if (!recorded) ctx.log(`failure for ${base.blockId.slice(0, 8)} discarded: text moved on`)
+  } finally {
+    await endWorking(ctx, working)
   }
 }
 
