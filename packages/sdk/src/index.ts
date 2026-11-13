@@ -82,6 +82,107 @@ export type ProgramEvent = PageChangedEvent
 /** Every event type a manifest may subscribe to. */
 export const eventTypes = ['page.changed'] as const satisfies readonly ProgramEvent['type'][]
 
+/** A scoped page read, captured at one revision. Mirrors `read_page`. */
+export type PageBlock = {
+  id: string
+  markdown: string
+  partial?: boolean
+  nodeRange?: { blockId: string; from: number; to: number }
+}
+
+export type PageOutlineEntry = {
+  blockId: string
+  nodeIndex: number
+  nodeId: string | null
+  type: string
+  headingPath: string[]
+  heading?: string
+  level?: number
+  markdownBytes: number
+}
+
+export type PresenceSelection = {
+  blockId: string
+  status: string
+  kind: 'caret' | 'selection' | null
+  startUtf16: number | null
+  endUtf16: number | null
+  quote: string | null
+}
+
+export type PresenceParticipant = {
+  peerId: string
+  principal: string
+  displayName: string | null
+  driver: string | null
+  lastSeen: string | null
+  selection: PresenceSelection | null
+}
+
+export type PageRead = {
+  title: string
+  heads: string[]
+  commentHeads: string[] | null
+  blocks: PageBlock[]
+  outline: PageOutlineEntry[]
+  presence: PresenceParticipant[]
+}
+
+export type ThreadAuthor = {
+  principal: string | null
+  displayName: string | null
+  driver: string | null
+  agent: { name: string | null; model: string | null } | null
+}
+
+export type ThreadMessage = {
+  id: string
+  body: string | null
+  author: ThreadAuthor | null
+  createdAt: string | null
+  deletedAt: string | null
+  /** True when the message was authored by this host's own principal. */
+  isSelf: boolean
+}
+
+export type ThreadRead = {
+  id: string
+  state: string | null
+  blockId: string | null
+  selection: { text: string } | null
+  messageCount: number
+  messages: ThreadMessage[]
+}
+
+export type PageReadInput = {
+  blockIds?: string[]
+  includeContent?: boolean
+  includePresence?: boolean
+  maxBytes?: number
+  /** Cancel a read that is taking too long; a timeout is a degraded read. */
+  signal?: AbortSignal
+}
+
+export type CommentReadInput = {
+  blockId?: string
+  threadIds?: string[]
+  state?: 'open' | 'resolved' | 'all'
+  includeMessages?: boolean
+  maxBytes?: number
+  /** Cancel a read that is taking too long; a timeout is a degraded read. */
+  signal?: AbortSignal
+}
+
+/**
+ * Read-only page context. The host supplies the Pages client; a program never
+ * talks to the network itself. Reads are scoped and best-effort: a caller must
+ * be able to answer from the trigger alone when a read is unavailable.
+ */
+export type ReadsCapability = {
+  page(input?: PageReadInput): Promise<PageRead>
+  comments(input?: CommentReadInput): Promise<ThreadRead[]>
+}
+
 export type ProgramState = {
   get<T>(key: string): Promise<T | undefined>
   set<T>(key: string, value: T): Promise<void>
@@ -105,6 +206,35 @@ export type ScratchState = {
 export type LlmCapability = {
   /** `signal`, if given, aborts the underlying request — for discarding stale speculative work. */
   complete(input: { system: string; prompt: string; signal?: AbortSignal }): Promise<string>
+  /**
+   * Optional tool-calling path. Hosts that do not implement it leave `undefined`; programs
+   * must fall back to a deterministic plan instead of failing.
+   */
+  completeWithTools?(input: {
+    system: string
+    prompt: string
+    tools: LlmTool[]
+    toolChoice?: 'auto' | 'required'
+    signal?: AbortSignal
+  }): Promise<LlmToolResponse>
+}
+
+/** A tool the model may call, in the OpenAI function-calling shape (without the wrapper). */
+export type LlmTool = {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+}
+
+export type LlmToolCall = {
+  id: string
+  name: string
+  arguments: unknown
+}
+
+export type LlmToolResponse = {
+  content: string | null
+  toolCalls: LlmToolCall[]
 }
 
 /** Comment writes. The host supplies the Pages client and credentials. */
@@ -121,6 +251,12 @@ export type CommentsCapability = {
     body: string
     dedupeOn: string
   }): Promise<{ threadId: string; messageId: string }>
+  /** Replies in an existing thread. Same idempotency approach. */
+  replyToThread(input: {
+    threadId: string
+    body: string
+    dedupeOn: string
+  }): Promise<{ threadId: string; messageId: string }>
 }
 
 /**
@@ -132,9 +268,33 @@ export type PresenceCapability = {
   showReading(blockId: string): Promise<void>
 }
 
+/**
+ * A UX hint only: publishes a short-lived "working on this" indicator, so a
+ * person sees the agent is busy before any reply is ready — not a
+ * correctness-bearing write. Works for browser-session credentials too, where
+ * the reading caret is suppressed. Safe to ignore on failure.
+ */
+export type ProgressCapability = {
+  /**
+   * Starts or renews a lease. Pass `progressId`/`leaseToken` from a previous
+   * report to renew instead of starting a second indicator.
+   */
+  report(input: {
+    message: string
+    blockId?: string
+    matchText?: string
+    progressId?: string
+    leaseToken?: string
+  }): Promise<{ progressId: string; leaseToken: string | null }>
+  /** Clears a lease. An expired lease is already gone, so this is safe to skip. */
+  clear(input: { progressId: string; leaseToken: string }): Promise<void>
+}
+
 export type ProgramContext = {
   /** The page this instance is watching. */
   pageId?: string
+  /** The host's own principal when known, for recognizing its own comments and presence. */
+  ownPrincipal?: string | null
   log(message: string, data?: Record<string, unknown>): void
   state: ProgramState
   scratch: ScratchState
@@ -142,6 +302,9 @@ export type ProgramContext = {
   llm?: LlmCapability
   comments?: CommentsCapability
   presence?: PresenceCapability
+  /** Present when the host can read page content and comments for context. */
+  reads?: ReadsCapability
+  progress?: ProgressCapability
 }
 
 export type Program = {

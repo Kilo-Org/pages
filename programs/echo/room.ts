@@ -37,12 +37,34 @@ export type Intent = {
 
 export type StepStatus = 'pending' | 'active' | 'done' | 'stale' | 'cancelled'
 
+/** Steps the executor can actually perform. A free-text plan is not executable. */
+export type StepKind = 'task' | 'draft_reply' | 'post_reply' | 'edit_reply'
+
+export const STEP_KINDS: readonly StepKind[] = [
+  'task',
+  'draft_reply',
+  'post_reply',
+  'edit_reply',
+]
+
+export type PlanStepInput = {
+  key: string
+  kind: StepKind
+  description: string
+  dependsOn?: string[]
+}
+
 export type PlanStep = {
   id: string
+  /** Plan-local key from the proposal, stable across versions. */
+  key: string
   intentId: string
   intentVersion: number
   status: StepStatus
+  kind: StepKind | null
   description: string
+  /** Ordering within a version; lower runs first. */
+  position: number
   owner: string | null
   dependsOn: string[]
   assumedRevision: string | null
@@ -55,6 +77,8 @@ export type TargetState = {
   pageId: string
   blockId: string
   text: string
+  /** The node text this change replaced, for correction prompts. */
+  previousText: string | null
   changedAt: number
   evaluatedText: string | null
   failures: number
@@ -79,6 +103,46 @@ export type SelectionEvidence = {
   observedAt: string
 }
 
+/** Compact, append-only activity. This is the archivist's warm tier: what
+ * happened, not a second copy of the page and not a transcript. */
+export type TimelineEntryKind =
+  | 'user_edit'
+  | 'user_comment'
+  | 'triage'
+  | 'intent_version'
+  | 'attempt_started'
+  | 'attempt_discarded'
+  | 'reply_written'
+  | 'reply_updated'
+  | 'failure'
+
+export type TimelineScope = {
+  blockId?: string
+  nodeKey?: string
+  threadId?: string
+}
+
+export type TimelineEntry = {
+  /** Stable across redeliveries: a repeated event cannot append a second row. */
+  id: string
+  at: string
+  kind: TimelineEntryKind
+  surface: 'body' | 'comment' | 'room'
+  scope: TimelineScope
+  intentId?: string
+  messageId?: string
+  /** Deterministic, compact, at most TIMELINE_SUMMARY_MAX characters. */
+  summary: string
+  data?: {
+    added?: string
+    removed?: string
+    outcome?: string
+    reason?: string
+    intentVersion?: number
+    source?: 'rules' | 'model'
+  }
+}
+
 export type RoomState = {
   schemaVersion: 1
   pageId: string
@@ -88,6 +152,10 @@ export type RoomState = {
   steps: Record<string, PlanStep>
   targets: Record<string, TargetState>
   selections: Record<string, SelectionEvidence>
+  /** threadId -> last message echo handled, so a redelivered event cannot double-reply. */
+  handledComments: Record<string, string>
+  /** Optional so a saved room written before the archivist remains readable. */
+  timeline?: TimelineEntry[]
 }
 
 export const emptyRoom = (pageId = ''): RoomState => ({
@@ -98,10 +166,57 @@ export const emptyRoom = (pageId = ''): RoomState => ({
   steps: {},
   targets: {},
   selections: {},
+  handledComments: {},
+  timeline: [],
 })
 
 const scopeKey = (scope: TargetScope) =>
   scope.threadId ?? scope.nodeKey ?? scope.blockId ?? 'page'
+
+const stepId = (intentId: string, version: number, key: string) =>
+  `${intentId}:${version}:${key}`
+
+const PLAN_KEY = /^[A-Za-z0-9_-]{1,40}$/
+
+/** Returns a human-readable problem, or null when the proposed plan is usable. */
+export function validatePlanSteps(steps: PlanStepInput[]): string | null {
+  if (steps.length < 1) return 'plan needs at least one step'
+  if (steps.length > 30) return 'plan supports at most thirty steps'
+  const keys = new Set<string>()
+  for (const step of steps) {
+    if (!PLAN_KEY.test(step.key)) return `invalid step key ${JSON.stringify(step.key)}`
+    if (keys.has(step.key)) return `duplicate step key ${step.key}`
+    keys.add(step.key)
+    if (!STEP_KINDS.includes(step.kind)) return `invalid step kind ${String(step.kind)}`
+    if (!step.description.trim()) return `step ${step.key} needs a description`
+    if (step.description.length > 200) return `step ${step.key} description is too long`
+  }
+  for (const step of steps) {
+    for (const dependency of step.dependsOn ?? []) {
+      if (dependency === step.key) return `step ${step.key} cannot depend on itself`
+      if (!keys.has(dependency)) return `step ${step.key} depends on missing ${dependency}`
+    }
+  }
+  const state = new Map<string, 'visiting' | 'done'>()
+  const visit = (key: string, path: string[]): string | null => {
+    const current = state.get(key)
+    if (current === 'done') return null
+    if (current === 'visiting') return `plan has a cycle: ${[...path, key].join(' -> ')}`
+    state.set(key, 'visiting')
+    const step = steps.find((candidate) => candidate.key === key)!
+    for (const dependency of step.dependsOn ?? []) {
+      const problem = visit(dependency, [...path, key])
+      if (problem) return problem
+    }
+    state.set(key, 'done')
+    return null
+  }
+  for (const step of steps) {
+    const problem = visit(step.key, [])
+    if (problem) return problem
+  }
+  return null
+}
 
 const copyTargets = (room: RoomState, targets: Record<string, TargetState>): RoomState => ({
   ...room,
@@ -130,6 +245,84 @@ export function findIntentForBlock(room: RoomState, blockId: string): Intent | u
   return Object.values(room.intents).find(
     (intent) => intent.status === 'active' && intent.targetScope.blockId === blockId,
   )
+}
+
+export function commentHandled(room: RoomState, threadId: string, messageId: string): boolean {
+  return room.handledComments[threadId] === messageId
+}
+
+export function markCommentHandled(
+  room: RoomState,
+  threadId: string,
+  messageId: string,
+): RoomState {
+  return {
+    ...room,
+    handledComments: { ...room.handledComments, [threadId]: messageId },
+  }
+}
+
+export type TriageApplication = { room: RoomState; intent: Intent }
+
+/**
+ * Applies a triage decision to the room. Body changes already bumped their
+ * intent in recordBodyChange; comment changes pass `bump: true`.
+ * Planning is a separate transition: chat and clarify deliberately get no steps.
+ */
+export function applyTriage(
+  room: RoomState,
+  input: {
+    intentId: string | null
+    kind: IntentKind
+    targetScope: TargetScope
+    confidence: number
+    evidence: EvidenceRef
+  },
+  now: string,
+  bump: boolean,
+): TriageApplication {
+  const intent =
+    (input.intentId && room.intents[input.intentId]) ||
+    (input.targetScope.threadId && findIntentForThread(room, input.targetScope.threadId)) ||
+    (input.targetScope.nodeKey && findActiveIntentForTarget(room, input.targetScope.nodeKey)) ||
+    (input.targetScope.threadId &&
+      input.targetScope.blockId &&
+      findIntentForBlock(room, input.targetScope.blockId)) ||
+    undefined
+  if (!intent) {
+    const admitted = admitIntent(
+      room,
+      {
+        kind: input.kind,
+        targetScope: input.targetScope,
+        outputKind: 'comment',
+        confidence: input.confidence,
+        evidence: [input.evidence],
+      },
+      now,
+    )
+    return { room: admitted.room, intent: admitted.intent }
+  }
+  const based = bump
+    ? cancelStaleSteps(bumpIntentVersion(room, intent.id, input.evidence, now), intent.id)
+    : room
+  const current = based.intents[intent.id] ?? intent
+  const evidence = bump
+    ? current.evidence
+    : current.evidence.some((ref) => ref.eventId === input.evidence.eventId)
+      ? current.evidence
+      : [...current.evidence, input.evidence]
+  const updated = copyIntents(based, {
+    ...based.intents,
+    [intent.id]: {
+      ...current,
+      kind: input.kind,
+      confidence: input.confidence,
+      evidence,
+      updatedAt: now,
+    },
+  })
+  return { room: updated, intent: updated.intents[intent.id]! }
 }
 
 export function admitIntent(
@@ -209,6 +402,124 @@ export function cancelStaleSteps(room: RoomState, intentId: string): RoomState {
     }),
   )
   return changed ? { ...room, steps } : room
+}
+
+/** Steps for one intent version, in execution order. */
+export function stepsForVersion(
+  room: RoomState,
+  intentId: string,
+  version: number,
+): PlanStep[] {
+  return Object.values(room.steps)
+    .filter((step) => step.intentId === intentId && step.intentVersion === version)
+    .sort((a, b) => a.position - b.position)
+}
+
+/** The executor's next unit of work: an active step, or the first pending step whose dependencies are done. */
+export function nextStep(room: RoomState, intentId: string): PlanStep | undefined {
+  const intent = room.intents[intentId]
+  if (!intent) return undefined
+  const steps = stepsForVersion(room, intentId, intent.version)
+  const active = steps.find((step) => step.status === 'active')
+  if (active) return active
+  return steps.find(
+    (step) =>
+      step.status === 'pending' &&
+      step.dependsOn.every((dependency) => room.steps[dependency]?.status === 'done'),
+  )
+}
+
+/**
+ * Creates the ordered plan for one intent version. A version that already has
+ * executed work is left alone, so a retry cannot overwrite progress.
+ */
+export function planIntent(
+  room: RoomState,
+  intentId: string,
+  version: number,
+  steps: PlanStepInput[],
+): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent || intent.version !== version) return room
+  if (validatePlanSteps(steps)) return room
+  const existing = stepsForVersion(room, intentId, version)
+  if (existing.some((step) => step.status === 'active' || step.status === 'done')) return room
+  const ids = new Map(steps.map((step) => [step.key, stepId(intentId, version, step.key)]))
+  const planned: PlanStep[] = steps.map((step, position) => ({
+    id: ids.get(step.key)!,
+    key: step.key,
+    intentId,
+    intentVersion: version,
+    status: 'pending',
+    kind: step.kind,
+    description: step.description,
+    position,
+    owner: null,
+    dependsOn: (step.dependsOn ?? []).map((key) => ids.get(key)!),
+    assumedRevision: null,
+  }))
+  const kept = Object.fromEntries(
+    Object.entries(room.steps).filter(
+      ([, step]) => !(step.intentId === intentId && step.intentVersion === version),
+    ),
+  )
+  const created = Object.fromEntries(planned.map((step) => [step.id, step]))
+  return { ...room, steps: { ...kept, ...created } }
+}
+
+export function activateStep(room: RoomState, id: string): RoomState {
+  const step = room.steps[id]
+  if (!step || step.status !== 'pending') return room
+  const intent = room.intents[step.intentId]
+  if (!intent || intent.version !== step.intentVersion) return room
+  return { ...room, steps: { ...room.steps, [id]: { ...step, status: 'active' } } }
+}
+
+export function completeStep(room: RoomState, id: string): RoomState {
+  const step = room.steps[id]
+  if (!step || (step.status !== 'pending' && step.status !== 'active')) return room
+  const intent = room.intents[step.intentId]
+  if (!intent || intent.version !== step.intentVersion) return room
+  return { ...room, steps: { ...room.steps, [id]: { ...step, status: 'done' } } }
+}
+
+/** A failed step becomes pending again so the next attempt can retry it. */
+export function failStep(room: RoomState, id: string): RoomState {
+  const step = room.steps[id]
+  if (!step || (step.status !== 'pending' && step.status !== 'active')) return room
+  return { ...room, steps: { ...room.steps, [id]: { ...step, status: 'pending' } } }
+}
+
+/**
+ * Completes the current plan after one executor pass. When `doneTaskKeys` is
+ * given, task steps outside that set stay pending; execution steps always finish.
+ */
+export function completePlan(
+  room: RoomState,
+  intentId: string,
+  doneTaskKeys?: ReadonlySet<string>,
+): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent) return room
+  let next = room
+  for (const step of stepsForVersion(room, intentId, intent.version)) {
+    if (step.status !== 'pending' && step.status !== 'active') continue
+    if (step.kind === 'task' && doneTaskKeys && !doneTaskKeys.has(step.key)) continue
+    next = completeStep(next, step.id)
+  }
+  return next
+}
+
+export function cancelPlan(room: RoomState, intentId: string): RoomState {
+  const intent = room.intents[intentId]
+  if (!intent) return room
+  let next = room
+  for (const step of stepsForVersion(room, intentId, intent.version)) {
+    if (step.status === 'pending' || step.status === 'active') {
+      next = { ...next, steps: { ...next.steps, [step.id]: { ...step, status: 'cancelled' } } }
+    }
+  }
+  return next
 }
 
 export function noteUserChange(
@@ -336,21 +647,16 @@ export function recordBodyChange(
   // carry that baseline even when a caller built it without the prior value.
   const nextTarget = prior ? { ...target, generation: prior.generation } : target
   const existing = findActiveIntentForTarget(room, target.key)
+  // Triage decides whether this change is an action, correction, chat or
+  // clarification, and creates the intent. Here we only carry the fence forward.
   if (!existing) {
-    const admitted = admitIntent(
-      room,
-      {
-        kind: 'action',
-        targetScope: { pageId: target.pageId, blockId: target.blockId, nodeKey: target.key },
-        outputKind: 'comment',
-        confidence: 1,
-        evidence: [evidence],
-      },
-      now,
+    return noteUserChange(
+      recordTarget(room, { ...nextTarget, assumedIntentVersion: null }),
+      target.key,
+      null,
     )
-    return noteUserChange(recordTarget(admitted.room, nextTarget), target.key, admitted.intent.id)
   }
-  const bumped = bumpIntentVersion(room, existing.id, evidence, now)
+  const bumped = cancelStaleSteps(bumpIntentVersion(room, existing.id, evidence, now), existing.id)
   return noteUserChange(recordTarget(bumped, nextTarget), target.key, existing.id)
 }
 
@@ -465,6 +771,8 @@ export function migrateNodes(
       pageId,
       blockId,
       text: record.text,
+      previousText:
+        typeof record.previousText === 'string' ? record.previousText : null,
       changedAt: typeof record.changedAt === 'number' ? record.changedAt : 0,
       evaluatedText:
         typeof record.evaluatedText === 'string' ? record.evaluatedText : null,
