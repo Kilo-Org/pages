@@ -114,7 +114,6 @@ export type TimelineEntryKind =
   | 'attempt_discarded'
   | 'reply_written'
   | 'reply_updated'
-  | 'reply_skipped'
   | 'failure'
 
 export type TimelineScope = {

@@ -1215,6 +1215,16 @@ describe('plan steps — the to-do list behind an intent', () => {
     expect(room.steps[`${intentId}:1:draft`]?.description).toBe('Draft the tightened paragraph')
     expect(room.steps[`${intentId}:1:post`]?.description).toBe('Post the tightened paragraph')
     expect(calls.some((call) => call.system.includes('You plan the work'))).toBe(true)
+    const planCall = calls.find((call) => call.system.includes('You plan the work'))
+    expect(planCall).toBeDefined()
+    expect(planCall!.system).toContain('prior model output')
+    const planEnvelope = JSON.parse(planCall!.prompt.slice(planCall!.prompt.indexOf('{'))) as {
+      task: { purpose: string; instruction: string }
+      context: { trigger: { text: string } }
+    }
+    expect(planEnvelope.task.purpose).toBe('plan')
+    expect(planEnvelope.task.instruction).toContain('todo_write')
+    expect(planEnvelope.context.trigger.text).toContain('tighten this paragraph')
     expect(comments.posts[0]?.body).toBe('Done.')
   })
 
@@ -1799,5 +1809,11 @@ describe('context assembly in echo', () => {
     expect(timeline.some((entry) => entry.kind === 'user_comment')).toBe(true)
     expect(timeline.some((entry) => entry.kind === 'triage')).toBe(true)
     expect(timeline.some((entry) => entry.kind === 'reply_written')).toBe(true)
+    expect(timeline.find((entry) => entry.kind === 'user_comment')?.scope).not.toHaveProperty(
+      'pageId',
+    )
+    expect(timeline.find((entry) => entry.kind === 'triage')?.scope).not.toHaveProperty(
+      'pageId',
+    )
   })
 })

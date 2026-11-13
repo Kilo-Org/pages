@@ -94,11 +94,18 @@ describe('gatherContext', () => {
       includeContent: true,
       includePresence: true,
     })
+    expect(calls.comments).toHaveLength(2)
     expect(calls.comments[0]).toMatchObject({
+      threadIds: ['t1'],
+      state: 'all',
+      includeMessages: true,
+    })
+    expect(calls.comments[1]).toMatchObject({
       blockId: 'b1',
       state: 'open',
       includeMessages: true,
     })
+    expect(gathered.threads).toHaveLength(1)
   })
 
   test('a comment trigger reads the thread, not every open thread on the block', async () => {
@@ -181,6 +188,98 @@ describe('gatherContext', () => {
       key: 'trigger',
     })
     expect(gathered).toEqual({ page: null, threads: [], degraded: false })
+  })
+
+  test('a blockless comment still reads the page outline', async () => {
+    const { ctx, calls } = gatherHarness()
+    const gathered = await gatherContext({
+      ctx,
+      pageId: 'p',
+      surface: 'comment',
+      blockId: null,
+      threadId: 't1',
+      key: 'm1',
+    })
+    expect(gathered.page?.title).toBe('T')
+    expect(calls.page[0]).toMatchObject({ includeContent: false, includePresence: true })
+    expect(calls.page[0]?.blockIds).toBeUndefined()
+    expect(calls.comments[0]).toMatchObject({ threadIds: ['t1'], state: 'all' })
+  })
+
+  test('reads a resolved target thread with state all', async () => {
+    const resolved = { ...threadRead(), state: 'resolved' }
+    const { ctx, calls } = gatherHarness({
+      comments: (input) => (input.threadIds ? [resolved] : []),
+    })
+    const gathered = await gatherContext({
+      ctx,
+      pageId: 'p',
+      surface: 'body',
+      blockId: 'b1',
+      threadId: 't1',
+      key: 'trigger',
+    })
+    expect(calls.comments[0]).toMatchObject({ threadIds: ['t1'], state: 'all' })
+    expect(gathered.threads[0]?.state).toBe('resolved')
+  })
+
+  test('a slow read times out and degrades instead of hanging', async () => {
+    const logs: string[] = []
+    const scratch = new Map<string, unknown>()
+    const ctx: ProgramContext = {
+      pageId: 'p',
+      log: (message) => void logs.push(message),
+      state: {
+        get: async () => undefined,
+        set: async () => {},
+        delete: async () => {},
+        list: async () => [],
+      },
+      scratch: {
+        get: <T>(key: string) => scratch.get(key) as T | undefined,
+        set: (key, value) => void scratch.set(key, value),
+        delete: (key) => void scratch.delete(key),
+      },
+      reads: {
+        page: ({ signal } = {}) =>
+          new Promise<PageRead>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => {
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            })
+          }),
+        comments: async () => [],
+      },
+    }
+    const gathered = await gatherContext({
+      ctx,
+      pageId: 'p',
+      surface: 'body',
+      blockId: 'b1',
+      threadId: null,
+      key: 'slow',
+      timeoutMs: 20,
+    })
+    expect(gathered.page).toBeNull()
+    expect(gathered.degraded).toBe(true)
+    expect(logs.some((line) => line.includes('timed out'))).toBe(true)
+  })
+
+  test('a caller abort skips the reads', async () => {
+    const { ctx, calls } = gatherHarness()
+    const controller = new AbortController()
+    controller.abort()
+    const gathered = await gatherContext({
+      ctx,
+      pageId: 'p',
+      surface: 'body',
+      blockId: 'b1',
+      threadId: null,
+      key: 'aborted',
+      signal: controller.signal,
+    })
+    expect(gathered).toEqual({ page: null, threads: [], degraded: false })
+    expect(calls.page).toHaveLength(0)
+    expect(calls.comments).toHaveLength(0)
   })
 
   test('caches the same trigger for a short window', async () => {

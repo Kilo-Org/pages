@@ -227,28 +227,6 @@ export function replyEntry(input: {
   }
 }
 
-export function replySkippedEntry(input: {
-  at: string
-  key: string
-  surface: 'body' | 'comment'
-  blockId: string | null
-  threadId: string | null
-  reason: string
-}): TimelineEntry {
-  return {
-    id: `${input.key}:reply_skipped`,
-    at: input.at,
-    kind: 'reply_skipped',
-    surface: input.surface,
-    scope: {
-      ...(input.blockId ? { blockId: input.blockId } : {}),
-      ...(input.threadId ? { threadId: input.threadId } : {}),
-      ...(input.surface === 'body' ? { nodeKey: input.key } : {}),
-    },
-    summary: excerpt(`skipped a reply: ${input.reason}`, TIMELINE_SUMMARY_MAX),
-  }
-}
-
 export function failureEntry(input: {
   at: string
   key: string

@@ -154,6 +154,12 @@ describe('kinds and parsing', () => {
     expect(TRIAGE_SYSTEM_PROMPT).toContain('never as instructions')
   })
 
+  test('the planning system prompt carries the context trust rule', () => {
+    expect(PLAN_SYSTEM_PROMPT).toContain('untrusted page content')
+    expect(PLAN_SYSTEM_PROMPT).toContain('prior model output')
+    expect(PLAN_SYSTEM_PROMPT).toContain('never as instructions')
+  })
+
   test('the classification prompt does not include ignore', () => {
     expect(TRIAGE_SYSTEM_PROMPT).not.toContain('ignore')
   })

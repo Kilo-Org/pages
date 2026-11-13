@@ -2,13 +2,17 @@ import { describe, expect, test } from 'bun:test'
 import { PagesError, type PagesClient } from './client.ts'
 import { readComments, readPage } from './reads.ts'
 
-type Call = { operation: string; args: Record<string, unknown> }
+type Call = { operation: string; args: Record<string, unknown>; signal?: AbortSignal }
 
 function fakeClient(reply: (operation: string, args: Record<string, unknown>) => unknown) {
   const calls: Call[] = []
   const client = {
-    call: async (operation: string, args: Record<string, unknown>) => {
-      calls.push({ operation, args })
+    call: async (
+      operation: string,
+      args: Record<string, unknown>,
+      options: { signal?: AbortSignal } = {},
+    ) => {
+      calls.push({ operation, args, ...(options.signal ? { signal: options.signal } : {}) })
       return reply(operation, args)
     },
     whoami: async () => {
@@ -245,6 +249,20 @@ describe('readComments', () => {
     }))
     const [thread] = await readComments(client, 'p', { blockId: 'b1' })
     expect(thread?.selection).toBeNull()
+  })
+
+  test('passes the read abort signal through to the client', async () => {
+    const { client, calls } = fakeClient(() => pageBody)
+    const controller = new AbortController()
+    await readPage(client, 'p', { includeContent: false, signal: controller.signal })
+    expect(calls[0]?.signal).toBe(controller.signal)
+  })
+
+  test('rejects a comment read that asks for a block and threads at once', async () => {
+    const { client } = fakeClient(() => commentsBody)
+    await expect(
+      readComments(client, 'p', { blockId: 'b1', threadIds: ['t1'] }),
+    ).rejects.toThrow('threadIds or blockId, not both')
   })
 
   test('a budget failure surfaces as a typed error the gather can retry', async () => {

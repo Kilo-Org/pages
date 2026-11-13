@@ -47,6 +47,7 @@ import {
   assembleContext,
   describeContext,
   renderPrompt,
+  type AssembledContext,
   type TriggerContext,
 } from './context.ts'
 import { gatherContext } from './gather.ts'
@@ -362,32 +363,17 @@ async function proposePlan(
   ctx: ProgramContext,
   input: {
     surface: 'body' | 'comment'
-    outcome: 'new_action' | 'correction'
-    request: string
-    previousText: string | null
-    previousReply: string | null
     hasReply: boolean
-    existingSteps: PlanStep[]
+    context: AssembledContext
   },
   signal?: AbortSignal,
 ): Promise<PlanStepInput[] | null> {
   if (!ctx.llm?.completeWithTools) return null
   try {
+    ctx.log(`context plan ${input.surface} ${describeContext(input.context)}`)
     const result = await ctx.llm.completeWithTools({
       system: PLAN_SYSTEM_PROMPT,
-      prompt: JSON.stringify({
-        surface: input.surface,
-        outcome: input.outcome,
-        request: input.request,
-        previousText: input.previousText,
-        previousReply: input.previousReply,
-        canEditReply: input.surface === 'body' && input.hasReply,
-        existingSteps: input.existingSteps.map((step) => ({
-          kind: step.kind,
-          description: step.description,
-          status: step.status,
-        })),
-      }),
+      prompt: renderPrompt(input.context),
       tools: [TODO_WRITE_TOOL],
       toolChoice: 'required',
       ...(signal ? { signal } : {}),
@@ -656,20 +642,57 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
     const plansIntent =
       applied.intent !== undefined &&
       (triage.outcome === 'new_action' || triage.outcome === 'correction')
+    const contextNow = new Date().toISOString()
+    const trigger: TriggerContext = {
+      surface: 'body',
+      change: 'updated',
+      text: base.text,
+      previousText: base.previousText,
+      threadId: base.threadId,
+      blockId: base.blockId,
+      messageId: base.messageId,
+      author: null,
+    }
+    const gathered = await gatherContext({
+      ctx,
+      pageId: base.pageId,
+      surface: 'body',
+      blockId: base.blockId,
+      threadId: base.threadId,
+      key: `${base.generation}:${base.text.length}:${base.text.slice(0, 80)}`,
+      signal,
+    })
     if (plansIntent) {
       const current = applied.intent!
       let planned = false
       if (applied.steps.length === 0) {
+        const planRoom = await loadRoom(ctx, base.pageId)
+        const planIntent = planRoom.intents[current.id] ?? current
+        const planAssembled = assembleContext({
+          purpose: 'plan',
+          trigger,
+          room: planRoom,
+          target: planRoom.targets[key] ?? null,
+          intent: planIntent,
+          steps: stepsForVersion(planRoom, planIntent.id, planIntent.version),
+          planTasks: applied.priorSteps.map((step) => ({
+            key: step.key,
+            description: step.description,
+            status: step.status,
+          })),
+          page: gathered.page,
+          threads: gathered.threads,
+          presence: gathered.page?.presence ?? [],
+          ownPrincipal: ctx.ownPrincipal,
+          degraded: gathered.degraded,
+          now: contextNow,
+        })
         const proposal = await proposePlan(
           ctx,
           {
             surface: 'body',
-            outcome: triage.outcome as 'new_action' | 'correction',
-            request: base.text,
-            previousText: base.previousText,
-            previousReply: base.lastReply,
             hasReply,
-            existingSteps: applied.priorSteps,
+            context: planAssembled,
           },
           signal,
         )
@@ -699,25 +722,6 @@ async function attempt(key: string, base: TargetState, ctx: ProgramContext, sign
       ? contextRoom.intents[applied.intent.id] ?? applied.intent
       : null
     const tasks = intent ? visibleTasks(contextRoom, intent.id) : []
-    const gathered = await gatherContext({
-      ctx,
-      pageId: base.pageId,
-      surface: 'body',
-      blockId: base.blockId,
-      threadId: base.threadId,
-      key: `${base.generation}:${base.text.length}:${base.text.slice(0, 80)}`,
-    })
-    const trigger: TriggerContext = {
-      surface: 'body',
-      change: 'updated',
-      text: base.text,
-      previousText: base.previousText,
-      threadId: base.threadId,
-      blockId: base.blockId,
-      messageId: base.messageId,
-      author: null,
-    }
-    const contextNow = new Date().toISOString()
     const assembled = assembleContext({
       purpose: triage.outcome === 'clarify' ? 'clarify' : 'reply',
       trigger,
@@ -909,31 +913,17 @@ async function handleComment(
 
   const plansIntent = triage.outcome === 'new_action' || triage.outcome === 'correction'
   const prior = triage.intentId ? snapshot.intents[triage.intentId] : undefined
-  const proposal = plansIntent
-    ? await proposePlan(ctx, {
-        surface: 'comment',
-        outcome: triage.outcome as 'new_action' | 'correction',
-        request: change.body ?? '',
-        previousText: null,
-        previousReply: null,
-        hasReply: false,
-        existingSteps: prior ? stepsForVersion(snapshot, prior.id, prior.version) : [],
-      })
-    : null
-  const scope = {
-    pageId,
+  const timelineScope = {
     ...(change.blockId ? { blockId: change.blockId } : {}),
     threadId: change.threadId,
   }
   const triageInput = {
     intentId: triage.intentId,
     kind: kindFor(triage.outcome),
-    targetScope: scope,
+    targetScope: { pageId, ...timelineScope },
     confidence: triage.confidence,
     evidence: { eventId, at, messageId: change.messageId! },
   }
-
-  const commentTasks = (proposal ?? []).filter((step) => step.kind === 'task')
   const gathered = await gatherContext({
     ctx,
     pageId,
@@ -952,6 +942,35 @@ async function handleComment(
     messageId: change.messageId,
     author: change.authorDisplayName ?? change.driver,
   }
+  const priorSteps = prior ? stepsForVersion(snapshot, prior.id, prior.version) : []
+  const proposal = plansIntent
+    ? await proposePlan(ctx, {
+        surface: 'comment',
+        hasReply: false,
+        context: assembleContext({
+          purpose: 'plan',
+          trigger,
+          room: snapshot,
+          target: null,
+          intent: prior ?? null,
+          intentKind: kindFor(triage.outcome),
+          steps: priorSteps,
+          planTasks: priorSteps.map((step) => ({
+            key: step.key,
+            description: step.description,
+            status: step.status,
+          })),
+          page: gathered.page,
+          threads: gathered.threads,
+          presence: gathered.page?.presence ?? [],
+          ownPrincipal: ctx.ownPrincipal,
+          degraded: gathered.degraded,
+          now: at,
+        }),
+      })
+    : null
+
+  const commentTasks = (proposal ?? []).filter((step) => step.kind === 'task')
   const assembled = assembleContext({
     purpose: triage.outcome === 'clarify' ? 'clarify' : 'reply',
     trigger,
@@ -992,7 +1011,7 @@ async function handleComment(
         eventId: `${eventId}:${change.messageId ?? change.threadId}`,
         at,
         surface: 'comment',
-        scope,
+        scope: timelineScope,
         triage,
       }),
     )

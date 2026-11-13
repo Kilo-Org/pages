@@ -55,11 +55,16 @@ export function createPagesClient(options: PagesClientOptions) {
   const origin = options.origin.replace(/\/+$/, '')
   const doFetch = options.fetch ?? fetch
 
-  async function send(operation: string, args: Record<string, unknown>): Promise<Response> {
+  async function send(
+    operation: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<Response> {
     return doFetch(`${origin}/api/tools`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin, ...(await options.auth.headers()) },
       body: JSON.stringify({ operation, arguments: args }),
+      ...(signal ? { signal } : {}),
     })
   }
 
@@ -83,10 +88,14 @@ export function createPagesClient(options: PagesClientOptions) {
     return body
   }
 
-  async function call(operation: string, args: Record<string, unknown>): Promise<unknown> {
-    let response = await send(operation, args)
+  async function call(
+    operation: string,
+    args: Record<string, unknown>,
+    callOptions: { signal?: AbortSignal } = {},
+  ): Promise<unknown> {
+    let response = await send(operation, args, callOptions.signal)
     if (response.status === 401 && options.auth.refresh && (await options.auth.refresh())) {
-      response = await send(operation, args)
+      response = await send(operation, args, callOptions.signal)
     }
     return parse(response)
   }

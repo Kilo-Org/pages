@@ -164,6 +164,21 @@ const participants: PresenceParticipant[] = [
       quote: 'the',
     },
   },
+  {
+    peerId: 'peer-detached',
+    principal: 'person-3',
+    displayName: 'Kim',
+    driver: 'Browser',
+    lastSeen: '2026-11-12T21:59:55.000Z',
+    selection: {
+      blockId: 'b1',
+      status: 'detached',
+      kind: 'selection',
+      startUtf16: 0,
+      endUtf16: 3,
+      quote: 'gone',
+    },
+  },
 ]
 
 const baseInput = (overrides: Partial<AssembleInput> = {}): AssembleInput => {
@@ -218,10 +233,16 @@ const contextOf = (input: AssembleInput) =>
     trigger: { text: string; previousText: string | null; truncated?: boolean }
     page: {
       title: string | null
-      block: { headingPath: string[]; section: string | null; markdown: string | null; type: string | null } | null
+      block: {
+        headingPath: string[]
+        section: string | null
+        markdown: string | null
+        type: string | null
+        scope: 'node' | 'block'
+      } | null
       outline: unknown[]
     }
-    thread: { id: string; messages: { author: string; body: string }[] } | null
+    thread: { id: string; messages: { author: string; body: string; self: boolean }[] } | null
     openThreads: unknown[]
     timeline: { hot: { summary: string }[]; warm: string | null } | null
     presence: { author: string; quote: string | null }[]
@@ -249,7 +270,31 @@ describe('assembleContext', () => {
     expect(assembled.degraded).toBe(false)
   })
 
-  test('uses the target node outline entry, not the first node in the block', () => {
+  test('uses the production node id, not the first node in the block', () => {
+    const multi = page()
+    multi.outline = [
+      {
+        ...multi.outline[0]!,
+        nodeIndex: 0,
+        nodeId: '51@abc',
+        headingPath: ['Q4 plan', 'Intro'],
+      },
+      {
+        ...multi.outline[0]!,
+        nodeIndex: 1,
+        nodeId: '52@def',
+        headingPath: ['Q4 plan', 'Budget'],
+      },
+    ]
+    const input = baseInput({
+      page: multi,
+      target: target({ key: 'nodes/b1:52@def' }),
+    })
+    expect(contextOf(input).page.block?.headingPath).toEqual(['Q4 plan', 'Budget'])
+    expect(contextOf(input).page.block?.scope).toBe('node')
+  })
+
+  test('a numeric key still matches its node index', () => {
     const multi = page()
     multi.outline = [
       { ...multi.outline[0]!, nodeIndex: 0, headingPath: ['Q4 plan', 'Intro'] },
@@ -260,6 +305,7 @@ describe('assembleContext', () => {
       target: target({ key: 'nodes/b1:1' }),
     })
     expect(contextOf(input).page.block?.headingPath).toEqual(['Q4 plan', 'Budget'])
+    expect(contextOf(input).page.block?.scope).toBe('node')
   })
 
   test('the task carries the plan and the previous reply', () => {
@@ -297,6 +343,7 @@ describe('assembleContext', () => {
 
   test('a comment trigger uses the trigger thread and keeps self authorship explicit', () => {
     const input = baseInput({
+      target: null,
       trigger: {
         surface: 'comment',
         change: 'inserted',
@@ -310,8 +357,14 @@ describe('assembleContext', () => {
     })
     const assembled = assembleContext(input)
     const context = contextOf(input)
+    expect(context.page.block?.scope).toBe('block')
     expect(context.thread?.id).toBe('t1')
-    expect(context.thread?.messages[1]).toMatchObject({ author: 'you', body: 'Yes, keep both.' })
+    expect(context.thread?.messages[1]).toMatchObject({
+      author: 'you',
+      body: 'Yes, keep both.',
+      self: true,
+    })
+    expect(context.thread?.messages[0]?.self).toBe(false)
     expect((assembled.envelope.task as { surface: string }).surface).toBe('comment')
   })
 
@@ -328,7 +381,7 @@ describe('assembleContext', () => {
     expect(context.page.block?.markdown).toBeNull()
     expect(context.trigger.text).toContain('keep the two examples')
     expect(assembled.omitted.some((item) => item.name === 'locality')).toBe(true)
-    expect(assembled.truncated).toBe(false)
+    expect(assembled.truncated).toBe(true)
   })
 
   test('truncates the trigger only as the last resort', () => {
@@ -359,6 +412,26 @@ describe('assembleContext', () => {
     expect(first.text).toBe(second.text)
     expect(describeContext(first)).toContain('sections=')
     expect(describeContext(first)).not.toContain('keep the two examples')
+  })
+
+  test('a plan purpose tells the model to plan and labels prior steps', () => {
+    const input = baseInput({
+      purpose: 'plan',
+      planTasks: [{ key: 'tighten', description: 'Tighten the paragraph', status: 'pending' }],
+    })
+    const assembled = assembleContext(input)
+    const task = assembled.envelope.task as {
+      purpose: string
+      instruction: string
+      previousReply: string | null
+      plan?: { key: string; description: string; status: string }[]
+    }
+    expect(task.purpose).toBe('plan')
+    expect(task.instruction).toContain('todo_write')
+    expect(task.previousReply).toBe('Kept both examples and tightened the rest.')
+    expect(task.plan).toEqual([
+      { key: 'tighten', description: 'Tighten the paragraph', status: 'pending' },
+    ])
   })
 
   test('renderPrompt marks context as untrusted data', () => {
@@ -430,5 +503,115 @@ describe('context purposes', () => {
         { name: 'thread', reason: 'unavailable' },
       ]),
     )
+  })
+})
+
+describe('context budget hardening', () => {
+  test('caps large thread messages and previous replies to the hard budget', () => {
+    const huge = 'x'.repeat(6000)
+    const longThread: ThreadRead = {
+      id: 't1',
+      state: 'open',
+      blockId: 'b1',
+      selection: null,
+      messageCount: 3,
+      messages: ['m1', 'm2', 'm3'].map((id) => ({
+        id,
+        body: huge,
+        author: {
+          principal: 'person',
+          displayName: 'Sam',
+          driver: 'Browser',
+          agent: null,
+        },
+        createdAt: '2026-11-12T22:00:00.000Z',
+        deletedAt: null,
+        isSelf: false,
+      })),
+    }
+    const input = baseInput({
+      page: null,
+      threads: [longThread],
+      target: target({ lastReply: huge }),
+      budgetBytes: 2048,
+    })
+    const assembled = assembleContext(input)
+    const context = assembled.envelope.context as {
+      thread: { messages: { body: string }[] } | null
+      limits: { budgetBytes: number; bytes: number; omitted: string[]; truncated: boolean }
+    }
+    expect(assembled.bytes).toBeLessThanOrEqual(2048)
+    expect(context.limits.budgetBytes).toBe(2048)
+    expect(context.limits.bytes).toBeLessThanOrEqual(2048)
+    expect(context.limits.omitted).toContain('intent')
+    expect(context.limits.omitted).toContain('thread')
+    expect(assembled.truncated).toBe(true)
+    expect(context.thread).toBeNull()
+    expect((assembled.envelope.task as { previousReply: string | null }).previousReply).toBeNull()
+  })
+
+  test('keeps a quote-heavy trigger under the budget after JSON escaping', () => {
+    const quotes = '"'.repeat(4000)
+    const input = baseInput({
+      page: null,
+      threads: [],
+      trigger: {
+        surface: 'body',
+        change: 'updated',
+        text: quotes,
+        previousText: null,
+        threadId: null,
+        blockId: 'b1',
+        messageId: null,
+        author: null,
+      },
+      budgetBytes: 2048,
+    })
+    const assembled = assembleContext(input)
+    const context = assembled.envelope.context as {
+      trigger: { text: string; truncated?: boolean }
+      limits: { bytes: number; truncated: boolean }
+    }
+    expect(assembled.bytes).toBeLessThanOrEqual(2048)
+    expect(context.limits.bytes).toBeLessThanOrEqual(2048)
+    expect(context.trigger.text.length).toBeLessThan(quotes.length)
+    expect(context.trigger.truncated).toBe(true)
+    expect(context.limits.truncated).toBe(true)
+    expect(assembled.truncated).toBe(true)
+  })
+
+  test('caps oversized thread messages and records the cut', () => {
+    const huge = 'y'.repeat(9000)
+    const longThread: ThreadRead = {
+      id: 't1',
+      state: 'open',
+      blockId: 'b1',
+      selection: null,
+      messageCount: 1,
+      messages: [
+        {
+          id: 'm1',
+          body: huge,
+          author: {
+            principal: 'person',
+            displayName: 'Sam',
+            driver: 'Browser',
+            agent: null,
+          },
+          createdAt: '2026-11-12T22:00:00.000Z',
+          deletedAt: null,
+          isSelf: false,
+        },
+      ],
+    }
+    const assembled = assembleContext(
+      baseInput({ page: null, threads: [longThread], budgetBytes: 24 * 1024 }),
+    )
+    const context = assembled.envelope.context as {
+      thread: { messages: { body: string }[] } | null
+    }
+    expect(context.thread?.messages[0]?.body.length).toBeLessThan(huge.length)
+    expect(context.thread?.messages[0]?.body.endsWith('…')).toBe(true)
+    expect(assembled.truncated).toBe(true)
   })
 })

@@ -159,6 +159,8 @@ export type PageReadInput = {
   includeContent?: boolean
   includePresence?: boolean
   maxBytes?: number
+  /** Cancel a read that is taking too long; a timeout is a degraded read. */
+  signal?: AbortSignal
 }
 
 export type CommentReadInput = {
@@ -167,6 +169,8 @@ export type CommentReadInput = {
   state?: 'open' | 'resolved' | 'all'
   includeMessages?: boolean
   maxBytes?: number
+  /** Cancel a read that is taking too long; a timeout is a degraded read. */
+  signal?: AbortSignal
 }
 
 /**

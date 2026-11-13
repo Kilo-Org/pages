@@ -216,7 +216,10 @@ export async function readPage(
   if (input.blockIds?.length) args.block_ids = input.blockIds
   if (input.includePresence) args.include_presence = true
   if (input.maxBytes !== undefined) args.max_bytes = input.maxBytes
-  const body = v.parse(PageReadResponse, await client.call('read_page', args))
+  const body = v.parse(
+    PageReadResponse,
+    await client.call('read_page', args, { signal: input.signal }),
+  )
   const outline = Array.isArray(body.outline)
     ? body.outline
     : body.outline?.entries ?? []
@@ -242,6 +245,9 @@ export async function readComments(
   options: { ownPrincipal?: string | null } = {},
 ): Promise<ThreadRead[]> {
   const ownPrincipal = options.ownPrincipal ?? null
+  if (input.threadIds?.length && input.blockId) {
+    throw new TypeError('readComments: pass threadIds or blockId, not both')
+  }
   const args: Record<string, unknown> = {
     page_id: pageId,
     state: input.state ?? 'open',
@@ -250,7 +256,10 @@ export async function readComments(
   if (input.threadIds?.length) args.thread_ids = input.threadIds
   else if (input.blockId) args.block_id = input.blockId
   if (input.maxBytes !== undefined) args.max_bytes = input.maxBytes
-  const body = v.parse(CommentsResponse, await client.call('list_page_comments', args))
+  const body = v.parse(
+    CommentsResponse,
+    await client.call('list_page_comments', args, { signal: input.signal }),
+  )
   return (body.comments ?? []).map((thread) => {
     const messages = (thread.messages ?? []).map((message) =>
       mapMessage(message, ownPrincipal),
