@@ -554,6 +554,9 @@ export function assembleContext(input: AssembleInput): AssembledContext {
     truncated = true
     limits.truncated = true
     if (!limits.omitted.includes('trigger')) limits.omitted.push('trigger')
+    if (!omitted.some((item) => item.name === 'trigger')) {
+      omitted.push({ name: 'trigger', reason: 'budget', detail: 'trigger text' })
+    }
     text = JSON.stringify(envelope, null, 2)
     limits.bytes = byteLength(text)
     text = JSON.stringify(envelope, null, 2)
