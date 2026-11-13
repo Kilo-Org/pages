@@ -266,9 +266,7 @@ const locality = (
       : undefined) ??
     entries[0]
   const exact = Boolean(
-    ref &&
-      entry &&
-      (entry.nodeId === ref || (entry.nodeId === null && String(entry.nodeIndex) === ref)),
+    ref && entry && (entry.nodeId === ref || String(entry.nodeIndex) === ref),
   )
   const headingPath = entry?.headingPath ?? []
   return {
@@ -555,6 +553,7 @@ export function assembleContext(input: AssembleInput): AssembledContext {
     trigger.truncated = true
     truncated = true
     limits.truncated = true
+    if (!limits.omitted.includes('trigger')) limits.omitted.push('trigger')
     text = JSON.stringify(envelope, null, 2)
     limits.bytes = byteLength(text)
     text = JSON.stringify(envelope, null, 2)
